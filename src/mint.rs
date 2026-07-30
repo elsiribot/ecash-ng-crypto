@@ -1,7 +1,8 @@
+use bitcoin_hashes::sha256;
 use bls12_381::{G1Projective, G2Projective, Scalar};
 use ff::Field;
 use rand::thread_rng;
-use std::{array, clone};
+use std::{array};
 
 use crate::generators;
 use crate::hash::hash_g1_to_g1;
@@ -35,6 +36,13 @@ pub struct Signature {
     pub sigma: G1Projective,
 }
 pub struct SecretKeyShare([Scalar; 4]);
+
+pub struct ECash {
+    pub signature: Signature,
+    pub value: Scalar,
+    pub serial: Scalar,
+    pub auth: sha256::Hash
+}
 
 pub fn mint_keygen(
     threshold: usize,

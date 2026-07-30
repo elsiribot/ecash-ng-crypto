@@ -18,7 +18,7 @@ use crate::hash::{hash_to_g1, map_to_scalar};
 use crate::issuance::{
     compute_c_m, get_challenge_issuance, issuance_homomorphism, prepare_issuance, IssuanceProof,
 };
-use crate::mint::{BatchedIssuance, PublicKeyShare, Signature, SignatureShare, AggregatePublicKey};
+use crate::mint::{BatchedIssuance, PublicKeyShare, Signature, SignatureShare, AggregatePublicKey, ECash};
 
 pub fn pedersen_commit(m: u64, r: Scalar) -> G1Projective {
     compute_pc(Scalar::from(m), r)
@@ -104,6 +104,28 @@ impl IssuanceRequest {
 
     fn blinding_factor(&self, pk: &[G1Projective; 4]) -> G1Projective {
         self.r_1 * pk[1] + self.r_2 * pk[2] + self.r_3 * pk[3]
+    }
+
+    pub fn finalize_issuance(
+        &self,
+        pk: &AggregatePublicKey,
+        signature: &Signature,
+        auth: sha256::Hash,
+    ) -> ECash {
+        let unblinded_signature = self.unblind_signature(&pk.g1, &signature.sigma);
+
+        assert!(self.verify_signature(&pk.g2, &signature.h, &unblinded_signature));
+        assert!(self.m_3 == map_to_scalar(&auth));
+
+        ECash {
+            signature: Signature { 
+                h: signature.h,
+                sigma: unblinded_signature 
+            },
+            value: self.m_1,
+            serial: self.m_2,
+            auth: auth
+        }
     }
 }
 
@@ -227,11 +249,12 @@ mod tests {
         assert!(batched_issuance.verify());
     }
     #[test]
-    fn test_signature_share() {
+    fn test_e_cash_generation() {
         let blinding_sk = Scalar::random(&mut thread_rng());
         let amount = 1000;
+        let auth = sha256::Hash::hash(&[0; 32]);
         let request_index = 1;
-        let first_request = IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
+        let first_request = IssuanceRequest::new(amount, auth, blinding_sk);
         let second_request =
             IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
         let mut batched_request = BatchedIssuanceRequest::new(&vec![first_request, second_request]);
@@ -254,5 +277,7 @@ mod tests {
         let signature = aggregate_signature_shares(batched_request.h, &signature_shares);
 
         assert!(batched_request.requests[request_index].verify_blind_signature(&agg_pub_keys, &signature));
-    }
+
+        let _e_cash_note = batched_request.requests[request_index].finalize_issuance(&agg_pub_keys, &signature, auth);
+    }    
 }
