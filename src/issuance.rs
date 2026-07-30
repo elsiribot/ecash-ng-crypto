@@ -5,18 +5,25 @@ use group::Curve;
 use rand::thread_rng;
 use std::array;
 use std::io::Write;
+use crate::hash::{hash_to_g1};
+
+pub struct IssuanceProof {
+    pub r: [G1Projective; 5],
+    pub s: [Scalar; 8],
+}
 
 pub fn issuance_homomorphism(
-    [m_1, m_2, m_3, r_p, r_m, r_1, r_2, r_3]: [Scalar; 8],
+    rho: Option<[Scalar; 8]>,
     h: G1Projective,
-) -> [G1Projective; 5] {
-    let pc = crate::compute_pc(m_1, r_p);
-    let c_m = compute_c_m(m_1, m_2, m_3, r_m);
-    let c_1 = compute_c_k(m_1, r_1, h);
-    let c_2 = compute_c_k(m_2, r_2, h);
-    let c_3 = compute_c_k(m_3, r_3, h);
+) -> ([G1Projective; 5], [Scalar; 8]) {
+    let rho = rho.unwrap_or(array::from_fn(|_| Scalar::random(&mut thread_rng())));
+    let pc = crate::compute_pc(rho[0], rho[3]);
+    let c_m = compute_c_m(rho[0], rho[1], rho[2], rho[4]);
+    let c_1 = compute_c_k(rho[0], rho[5], h);
+    let c_2 = compute_c_k(rho[1], rho[6], h);
+    let c_3 = compute_c_k(rho[2], rho[7], h);
 
-    [pc, c_m, c_1, c_2, c_3]
+    ([pc, c_m, c_1, c_2, c_3], rho)
 }
 
 pub fn compute_c_m(m_1: Scalar, m_2: Scalar, m_3: Scalar, r_m: Scalar) -> G1Projective {
@@ -30,42 +37,47 @@ pub fn compute_c_k(m: Scalar, r: Scalar, h: G1Projective) -> G1Projective {
     m * h + r * crate::generators::ecash_g1()
 }
 
-pub fn prove_issuance(
-    y: [G1Projective; 5],
-    x: [Scalar; 8],
-    h: G1Projective,
-) -> ([G1Projective; 5], [Scalar; 8]) {
+pub fn prove_issuance(y: [G1Projective; 5], x: [Scalar; 8], h: G1Projective) -> IssuanceProof {
     let r = array::from_fn(|_| Scalar::random(&mut thread_rng()));
+    let (r_proof, _) = issuance_homomorphism(Some(r), h);
 
-    let r_proof = issuance_homomorphism(r, h);
-
-    let challenge = get_challenge_issuance(y, r_proof);
+    let challenge = get_challenge_issuance(&vec![y], &r_proof, 0_usize);
 
     let s_proof = array::from_fn(|i| r[i] + challenge * x[i]);
 
     assert!(verify_issuance(y, r_proof, s_proof));
 
-    (r_proof, s_proof)
+    IssuanceProof {
+        r: r_proof,
+        s: s_proof,
+    }
 }
 
 pub fn verify_issuance(y: [G1Projective; 5], r: [G1Projective; 5], s: [Scalar; 8]) -> bool {
     let h = crate::hash::hash_g1_to_g1(y[1]);
-    let challenge = get_challenge_issuance(y, r);
+    let challenge = get_challenge_issuance(&vec![y], &r, 0_usize);
 
-    issuance_homomorphism(s, h) == array::from_fn(|i| (challenge * y[i] + r[i]))
+    let (r_proof, _) = issuance_homomorphism(Some(s), h);
+    r_proof == array::from_fn(|i| challenge * y[i] + r[i])
 }
 
-fn get_challenge_issuance(y: [G1Projective; 5], r: [G1Projective; 5]) -> Scalar {
+pub fn get_challenge_issuance(
+    y: &Vec<[G1Projective; 5]>,
+    r: &[G1Projective; 5],
+    index: usize,
+) -> Scalar {
     let mut engine = sha256::HashEngine::default();
 
     engine
         .write_all("FEDIMINT_ECASH_CHALLENGE_ISSUANCE".as_bytes())
         .expect("Writing to hash engine can't fail");
 
-    for point in y {
-        engine
-            .write_all(&point.to_affine().to_compressed())
-            .expect("Writing to hash engine can't fail");
+    for instance in y {
+        for point in instance {
+            engine
+                .write_all(&point.to_affine().to_compressed())
+                .expect("Writing to hash engine can't fail");
+        }
     }
 
     for point in r {
@@ -73,6 +85,9 @@ fn get_challenge_issuance(y: [G1Projective; 5], r: [G1Projective; 5]) -> Scalar 
             .write_all(&point.to_affine().to_compressed())
             .expect("Writing to hash engine can't fail");
     }
+    engine
+        .write_all(&index.to_be_bytes())
+        .expect("Writing the index to the engine failed");
 
     let hash = sha256::Hash::from_engine(engine);
 
@@ -88,19 +103,47 @@ pub fn prepare_issuance(
     r_1: Scalar,
     r_2: Scalar,
     r_3: Scalar,
-) -> ([G1Projective; 5], [G1Projective; 5], [Scalar; 8]) {
+    h: G1Projective,
+) -> [G1Projective; 5] {
     let pc = crate::compute_pc(m_1, r_p);
     let c_m = compute_c_m(m_1, m_2, m_3, r_m);
-
-    let h = crate::hash::hash_g1_to_g1(compute_c_m(m_1, m_2, m_3, r_m));
 
     let c_1 = compute_c_k(m_1, r_1, h);
     let c_2 = compute_c_k(m_2, r_2, h);
     let c_3 = compute_c_k(m_3, r_3, h);
 
-    let y = [pc, c_m, c_1, c_2, c_3];
+    [pc, c_m, c_1, c_2, c_3]
+}
 
-    let (r, s) = prove_issuance(y, [m_1, m_2, m_3, r_p, r_m, r_1, r_2, r_3], h);
+pub fn verify_batched_issuance(
+    y: &Vec<[G1Projective; 5]>,
+    proof: &IssuanceProof,
+) -> bool {
+    let mut rhs: [G1Projective; 5] = std::array::from_fn(|_| G1Projective::identity());
+    let h = compute_batched_h(y);
+    for index in 0..y.len() {
+        let challenge_request = get_challenge_issuance(&y, &proof.r, index);
+        for (point, new_point) in rhs.iter_mut().zip(y[index].iter()) {
+            *point += *new_point * challenge_request;
+        }
+    }
+    for (point, new_point) in rhs.iter_mut().zip(proof.r.iter()) {
+        *point += *new_point;
+    }
 
-    (y, r, s)
+    let (r_proof, _) = issuance_homomorphism(Some(proof.s), h);
+    r_proof == rhs
+}
+
+pub fn compute_batched_h(
+    batched_y: &Vec<[G1Projective; 5]>
+) -> G1Projective {
+    let batched_c_m_bytes = batched_y.iter().fold(Vec::new(), |mut acc, y| {
+        let c_m = y[1]
+            .to_affine()
+            .to_compressed();
+        acc.extend_from_slice(c_m.as_slice());
+        acc
+    });
+    hash_to_g1(&batched_c_m_bytes)
 }

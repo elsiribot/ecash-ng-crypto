@@ -3,9 +3,9 @@
 mod generators;
 mod hash;
 mod issuance;
+mod mint;
 mod spend;
 
-use std::array;
 use std::collections::BTreeMap;
 
 use bitcoin_hashes::sha256;
@@ -14,35 +14,16 @@ use ff::Field;
 use group::Curve;
 use rand::thread_rng;
 
-use crate::hash::hash_g1_to_g1;
-use crate::hash::map_to_scalar;
-use crate::issuance::compute_c_m;
-use crate::issuance::prepare_issuance;
-use crate::issuance::verify_issuance;
-use crate::spend::compute_k;
-use crate::spend::prepare_spend;
-use crate::spend::verify_spend;
+use crate::hash::{hash_to_g1, map_to_scalar};
+use crate::issuance::{
+    compute_c_m, get_challenge_issuance, issuance_homomorphism, prepare_issuance, IssuanceProof,
+};
+use crate::mint::{PublicKeyShare, Signature, SignatureShare, BatchedIssuance};
 
 pub fn pedersen_commit(m: u64, r: Scalar) -> G1Projective {
     compute_pc(Scalar::from(m), r)
 }
-
-pub struct AggregatePublicKey {
-    g1: [G1Projective; 4],
-    g2: [G2Projective; 4],
-}
-
-pub struct PublicKeyShare {
-    g1: [G1Projective; 4],
-    g2: [G2Projective; 4],
-}
-
-pub struct SecretKeyShare([Scalar; 4]);
-
-pub struct SignatureShare(G1Projective);
-
-pub struct Signature(G1Projective);
-
+#[derive(Copy, Clone)]
 pub struct IssuanceRequest {
     m_1: Scalar,
     m_2: Scalar,
@@ -52,6 +33,11 @@ pub struct IssuanceRequest {
     r_1: Scalar,
     r_2: Scalar,
     r_3: Scalar,
+}
+pub struct BatchedIssuanceRequest {
+    requests: Vec<IssuanceRequest>,
+    batched_y: Vec<[G1Projective; 5]>,
+    h: G1Projective,
 }
 
 impl IssuanceRequest {
@@ -77,190 +63,122 @@ impl IssuanceRequest {
         }
     }
 
-    fn compute_h(&self) -> G1Projective {
-        hash_g1_to_g1(compute_c_m(self.m_1, self.m_2, self.m_3, self.r_m))
-    }
-
-    pub fn prepare_issuance(&self) -> Issuance {
-        let (y, r, s) = prepare_issuance(
-            self.m_1, self.m_2, self.m_3, self.r_p, self.r_m, self.r_1, self.r_2, self.r_3,
-        );
-
-        assert_eq!(hash_g1_to_g1(y[1]), self.compute_h());
-
-        Issuance { y, r, s }
-    }
-
     pub fn verify_blind_signature_share(
         &self,
         pk: &PublicKeyShare,
+        h: &G1Projective,
         signature: &SignatureShare,
     ) -> bool {
-        self.verify_signature(&pk.g2, &self.unblind_signature(&pk.g1, &signature.0))
-    }
-
-    pub fn verify_blind_signature(&self, pk: &AggregatePublicKey, signature: &Signature) -> bool {
-        self.verify_signature(&pk.g2, &self.unblind_signature(&pk.g1, &signature.0))
+        self.verify_signature(&pk.g2, h, &self.unblind_signature(&pk.g1, &signature.0))
     }
 
     fn unblind_signature(&self, g1: &[G1Projective; 4], signature: &G1Projective) -> G1Projective {
-        signature - blinding_factor(g1, self.r_1, self.r_2, self.r_3)
+        signature - self.blinding_factor(g1)
     }
 
-    fn verify_signature(&self, g2: &[G2Projective; 4], signature: &G1Projective) -> bool {
-        let message = compute_message(g2, self.m_1, self.m_2, self.m_3);
-
-        verify(message, self.compute_h(), *signature)
+    fn compute_message(&self, pk: &[G2Projective; 4]) -> G2Projective {
+        pk[0] + self.m_1 * pk[1] + self.m_2 * pk[2] + self.m_3 * pk[3]
     }
 
-    pub fn finalize_issuance(
+    fn verify_pairing(&self, message: G2Projective, h: G1Projective, s: G1Projective) -> bool {
+        let p_m = pairing(&h.to_affine(), &message.to_affine());
+        let p_s = pairing(&s.to_affine(), &generators::ecash_g2().to_affine());
+
+        p_m == p_s
+    }
+
+    fn verify_signature(
         &self,
-        pk: &AggregatePublicKey,
-        signature: &Signature,
-    ) -> SpendRequest {
-        let signature = self.unblind_signature(&pk.g1, &signature.0);
+        g2: &[G2Projective; 4],
+        h: &G1Projective,
+        signature: &G1Projective,
+    ) -> bool {
+        let message = self.compute_message(g2);
 
-        assert!(self.verify_signature(&pk.g2, &signature));
+        self.verify_pairing(message, *h, *signature)
+    }
 
-        let r = Scalar::random(&mut thread_rng());
+    fn blinding_factor(&self, pk: &[G1Projective; 4]) -> G1Projective {
+        self.r_1 * pk[1] + self.r_2 * pk[2] + self.r_3 * pk[3]
+    }
+}
 
-        let h = r * self.compute_h();
-        let signature = r * signature;
+impl BatchedIssuanceRequest {
+    pub fn new(requests: &Vec<IssuanceRequest>) -> Self {
+        let batched_c_m_bytes = requests.iter().fold(Vec::new(), |mut acc, requst| {
+            let c_m = compute_c_m(requst.m_1, requst.m_2, requst.m_3, requst.r_m)
+                .to_affine()
+                .to_compressed();
+            acc.extend_from_slice(c_m.as_slice());
+            acc
+        });
+        BatchedIssuanceRequest {
+            requests: requests.clone(),
+            batched_y: Vec::new(),
+            h: hash_to_g1(&batched_c_m_bytes),
+        }
+    }
 
-        SpendRequest {
-            m_2: self.m_2,
-            h,
-            signature,
+    pub fn add_request(&mut self, request: &IssuanceRequest) {
+        self.requests.push(request.clone());
+    }
+
+    pub fn prepare_batched_issuance(&mut self) -> BatchedIssuance {
+        let mut r_proof: [G1Projective; 5] = std::array::from_fn(|_| G1Projective::identity());
+        let mut batched_rho = Vec::new();
+        let mut s_proof: [Scalar; 8] = std::array::from_fn(|_| Scalar::zero());
+        self.batched_y = self
+            .requests
+            .iter()
+            .map(|item| {
+                prepare_issuance(
+                    item.m_1, item.m_2, item.m_3, item.r_p, item.r_m, item.r_1, item.r_2, item.r_3,
+                    self.h,
+                )
+            })
+            .collect::<Vec<[G1Projective; 5]>>();
+        for _ in &self.requests {
+            let (r_proof_request, rho_request) = issuance_homomorphism(None, self.h);
+            batched_rho.push(rho_request);
+            for (point, new_point) in r_proof.iter_mut().zip(r_proof_request.iter()) {
+                *point += *new_point;
+            }
+        }
+        for index in 0..self.requests.len() {
+            let challenge_request = get_challenge_issuance(&self.batched_y, &r_proof, index);
+            let rho = batched_rho[index];
+            s_proof[0] += rho[0] + challenge_request * self.requests[index].m_1;
+            s_proof[1] += rho[1] + challenge_request * self.requests[index].m_2;
+            s_proof[2] += rho[2] + challenge_request * self.requests[index].m_3;
+            s_proof[3] += rho[3] + challenge_request * self.requests[index].r_p;
+            s_proof[4] += rho[4] + challenge_request * self.requests[index].r_m;
+            s_proof[5] += rho[5] + challenge_request * self.requests[index].r_1;
+            s_proof[6] += rho[6] + challenge_request * self.requests[index].r_2;
+            s_proof[7] += rho[7] + challenge_request * self.requests[index].r_3;
+        }
+        BatchedIssuance { 
+            y: self.batched_y.clone(),
+            proof: IssuanceProof { 
+                r: r_proof,
+                s: s_proof 
+            }
         }
     }
 }
 
-pub struct Issuance {
-    y: [G1Projective; 5],
-    r: [G1Projective; 5],
-    s: [Scalar; 8],
-}
-
-impl Issuance {
-    pub fn verify(&self) -> bool {
-        verify_issuance(self.y, self.r, self.s)
-    }
-
-    pub fn amount_commitment(&self) -> G1Projective {
-        self.y[0]
-    }
-
-    pub fn sign(&self, secret_key: &SecretKeyShare) -> SignatureShare {
-        let h = hash_g1_to_g1(self.y[1]);
-
-        SignatureShare(sign_blinded_message(
-            secret_key.0,
-            h,
-            self.y[2],
-            self.y[3],
-            self.y[4],
-        ))
-    }
-}
-
-pub struct SpendRequest {
-    m_2: Scalar,
+pub fn aggregate_signature_shares(
     h: G1Projective,
-    signature: G1Projective,
-}
-
-impl SpendRequest {
-    pub fn verify(&self, pk: &AggregatePublicKey, amount: u64, auth: sha256::Hash) -> bool {
-        let m_1 = Scalar::from(amount);
-        let m_3 = map_to_scalar(&auth);
-
-        let message = pk.g2[0] + compute_k(m_1, self.m_2, pk.g2) + m_3 * pk.g2[3];
-
-        verify(message, self.h, self.signature)
-    }
-
-    pub fn prepare_spend(&self, pk: &AggregatePublicKey, amount: u64, r_p: Scalar) -> Spend {
-        let m_1 = Scalar::from(amount);
-
-        let (y, r, s) = prepare_spend(m_1, self.m_2, r_p, pk.g2);
-
-        Spend {
-            y,
-            r,
-            s,
-            h: self.h,
-            signature: self.signature,
-        }
-    }
-}
-
-pub struct Spend {
-    y: (G1Projective, G2Projective),
-    r: (G1Projective, G2Projective),
-    s: [Scalar; 3],
-    h: G1Projective,
-    signature: G1Projective,
-}
-
-impl Spend {
-    fn verify(&self, pk: AggregatePublicKey, authentication: sha256::Hash) -> bool {
-        let message = pk.g2[0] + self.y.1 + map_to_scalar(&authentication) * pk.g2[3];
-
-        verify_spend(self.y, self.r, self.s, pk.g2) && verify(message, self.h, self.signature)
-    }
-
-    fn amount_commitment(&self) -> G1Projective {
-        self.y.0
-    }
-}
-
-fn compute_pc(m: Scalar, r: Scalar) -> G1Projective {
-    m * generators::pedersen_g() + r * generators::pedersen_h()
-}
-
-fn compute_blinding_factor(
-    pk: [G1Projective; 4],
-    r_1: Scalar,
-    r_2: Scalar,
-    r_3: Scalar,
-) -> G1Projective {
-    (r_1 * pk[1]) + (r_2 * pk[2]) + (r_3 * pk[3])
-}
-
-fn sign_blinded_message(
-    sk: [Scalar; 4],
-    h: G1Projective,
-    c_1: G1Projective,
-    c_2: G1Projective,
-    c_3: G1Projective,
-) -> G1Projective {
-    sk[0] * h + sk[1] * c_1 + sk[2] * c_2 + sk[3] * c_3
-}
-
-fn blinding_factor(pk: &[G1Projective; 4], r_1: Scalar, r_2: Scalar, r_3: Scalar) -> G1Projective {
-    r_1 * pk[1] + r_2 * pk[2] + r_3 * pk[3]
-}
-
-fn compute_message(pk: &[G2Projective; 4], m_1: Scalar, m_2: Scalar, m_3: Scalar) -> G2Projective {
-    pk[0] + m_1 * pk[1] + m_2 * pk[2] + m_3 * pk[3]
-}
-
-fn verify(message: G2Projective, h: G1Projective, s: G1Projective) -> bool {
-    let p_m = pairing(&h.to_affine(), &message.to_affine());
-    let p_s = pairing(&s.to_affine(), &generators::ecash_g2().to_affine());
-
-    p_m == p_s
-}
-
-pub fn aggregate_signature_shares(shares: &BTreeMap<u64, SignatureShare>) -> Signature {
-    Signature(
-        lagrange_multipliers(shares.keys().cloned().map(Scalar::from).collect())
+    shares: &BTreeMap<u64, SignatureShare>,
+) -> Signature {
+    Signature {
+        h,
+        sigma: lagrange_multipliers(shares.keys().cloned().map(Scalar::from).collect())
             .into_iter()
             .zip(shares.values())
             .map(|(lagrange_multiplier, share)| lagrange_multiplier * share.0)
             .reduce(|a, b| a + b)
             .expect("We have at least one share"),
-    )
+    }
 }
 
 fn lagrange_multipliers(scalars: Vec<Scalar>) -> Vec<Scalar> {
@@ -277,57 +195,8 @@ fn lagrange_multipliers(scalars: Vec<Scalar>) -> Vec<Scalar> {
         .collect()
 }
 
-// Helper functions for testing and benchmarking
-fn dealer_keygen(
-    threshold: usize,
-    keys: usize,
-) -> (AggregatePublicKey, Vec<PublicKeyShare>, Vec<SecretKeyShare>) {
-    let polys: [Vec<Scalar>; 4] = array::from_fn(|_| random_polynomial(threshold));
-
-    let g1 = polys
-        .clone()
-        .map(|p| generators::ecash_g1() * evaluate(&p, &Scalar::zero()));
-
-    let g2 = polys
-        .clone()
-        .map(|p| generators::ecash_g2() * evaluate(&p, &Scalar::zero()));
-
-    let apk = AggregatePublicKey { g1, g2 };
-
-    let sks = (0..keys)
-        .map(|idx| {
-            SecretKeyShare(
-                polys
-                    .clone()
-                    .map(|p| evaluate(&p, &Scalar::from(idx as u64 + 1))),
-            )
-        })
-        .collect::<Vec<SecretKeyShare>>();
-
-    let pks = sks
-        .iter()
-        .map(|sk| PublicKeyShare {
-            g1: sk.0.map(|s| (generators::ecash_g1() * s)),
-            g2: sk.0.map(|s| (generators::ecash_g2() * s)),
-        })
-        .collect::<Vec<PublicKeyShare>>();
-
-    (apk, pks, sks)
-}
-
-fn random_polynomial(degree: usize) -> Vec<Scalar> {
-    (0..degree)
-        .map(|_| Scalar::random(&mut thread_rng()))
-        .collect()
-}
-
-fn evaluate(coefficients: &[Scalar], x: &Scalar) -> Scalar {
-    coefficients
-        .iter()
-        .cloned()
-        .rev()
-        .reduce(|acc, coefficient| acc * x + coefficient)
-        .expect("We have at least one coefficient")
+fn compute_pc(m: Scalar, r: Scalar) -> G1Projective {
+    m * generators::pedersen_g() + r * generators::pedersen_h()
 }
 
 #[cfg(test)]
@@ -336,53 +205,20 @@ mod tests {
     use bls12_381::Scalar;
     use ff::Field;
     use rand::thread_rng;
-    use std::collections::BTreeMap;
 
-    use crate::{aggregate_signature_shares, dealer_keygen, IssuanceRequest, SignatureShare};
+    use crate::{BatchedIssuanceRequest, IssuanceRequest};
 
     #[test]
-    fn test_roundtrip() {
+    fn test_issuance_request() {
         let blinding_sk = Scalar::random(&mut thread_rng());
+        let amount = 1000;
+        let first_request = IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
+        let second_request =
+            IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
+        let mut batched_request = BatchedIssuanceRequest::new(&vec![first_request, second_request]);
 
-        let request = IssuanceRequest::new(1000, sha256::Hash::hash(&[0; 32]), blinding_sk);
+        let batched_issuance = batched_request.prepare_batched_issuance();
 
-        let issuance = request.prepare_issuance();
-
-        assert!(issuance.verify());
-
-        assert_eq!(
-            issuance.amount_commitment(),
-            crate::pedersen_commit(1000, blinding_sk)
-        );
-
-        let (apk, pks, sks) = dealer_keygen(5, 7);
-
-        let signature_shares = sks
-            .iter()
-            .map(|sk| issuance.sign(sk))
-            .collect::<Vec<SignatureShare>>();
-
-        for (pk, share) in pks.iter().zip(signature_shares.iter()) {
-            assert!(request.verify_blind_signature_share(pk, &share));
-        }
-
-        let signature_shares = (1_u64..)
-            .zip(signature_shares)
-            .take(5)
-            .collect::<BTreeMap<u64, SignatureShare>>();
-
-        let signature = aggregate_signature_shares(&signature_shares);
-
-        assert!(request.verify_blind_signature(&apk, &signature));
-
-        let spend_request = request.finalize_issuance(&apk, &signature);
-
-        assert!(spend_request.verify(&apk, 1000, sha256::Hash::hash(&[0; 32])));
-
-        let r_p = Scalar::random(&mut thread_rng());
-
-        let spend = spend_request.prepare_spend(&apk, 1000, r_p);
-
-        assert!(spend.verify(apk, sha256::Hash::hash(&[0; 32])));
+        assert!(batched_issuance.verify());
     }
 }
