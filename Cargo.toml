@@ -17,6 +17,3 @@ serde = { version = "1.0", features = ["derive"] }
 [dev-dependencies]
 divan = "0.1"
 
-[[bench]]
-name = "issuance"
-harness = false
