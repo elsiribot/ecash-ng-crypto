@@ -1,3 +1,4 @@
+use crate::hash::hash_to_g1;
 use bitcoin_hashes::sha256;
 use bls12_381::{G1Projective, Scalar};
 use ff::Field;
@@ -5,7 +6,6 @@ use group::Curve;
 use rand::thread_rng;
 use std::array;
 use std::io::Write;
-use crate::hash::{hash_to_g1};
 
 pub struct IssuanceProof {
     pub r: [G1Projective; 5],
@@ -115,10 +115,7 @@ pub fn prepare_issuance(
     [pc, c_m, c_1, c_2, c_3]
 }
 
-pub fn verify_batched_issuance(
-    y: &Vec<[G1Projective; 5]>,
-    proof: &IssuanceProof,
-) -> bool {
+pub fn verify_batched_issuance(y: &Vec<[G1Projective; 5]>, proof: &IssuanceProof) -> bool {
     let mut rhs: [G1Projective; 5] = std::array::from_fn(|_| G1Projective::identity());
     let h = compute_batched_h(y);
     for index in 0..y.len() {
@@ -135,13 +132,9 @@ pub fn verify_batched_issuance(
     r_proof == rhs
 }
 
-pub fn compute_batched_h(
-    batched_y: &Vec<[G1Projective; 5]>
-) -> G1Projective {
+pub fn compute_batched_h(batched_y: &Vec<[G1Projective; 5]>) -> G1Projective {
     let batched_c_m_bytes = batched_y.iter().fold(Vec::new(), |mut acc, y| {
-        let c_m = y[1]
-            .to_affine()
-            .to_compressed();
+        let c_m = y[1].to_affine().to_compressed();
         acc.extend_from_slice(c_m.as_slice());
         acc
     });

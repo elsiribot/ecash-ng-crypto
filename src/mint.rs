@@ -5,7 +5,7 @@ use std::array;
 
 use crate::generators;
 use crate::hash::hash_g1_to_g1;
-use crate::issuance::{verify_issuance, IssuanceProof, verify_batched_issuance};
+use crate::issuance::{compute_batched_h, verify_batched_issuance, verify_issuance, IssuanceProof};
 
 pub struct AggregatePublicKey {
     pub g1: [G1Projective; 4],
@@ -24,7 +24,7 @@ pub struct Issuance {
 }
 
 pub struct BatchedIssuance {
-    pub y: Vec<[G1Projective; 5]>,
+    pub batched_y: Vec<[G1Projective; 5]>,
     pub proof: IssuanceProof,
 }
 
@@ -37,7 +37,7 @@ pub struct Signature {
 
 pub struct SecretKeyShare([Scalar; 4]);
 
-fn mint_keygen(
+pub fn mint_keygen(
     threshold: usize,
     keys: usize,
 ) -> (AggregatePublicKey, Vec<PublicKeyShare>, Vec<SecretKeyShare>) {
@@ -109,7 +109,22 @@ impl Issuance {
 
 impl BatchedIssuance {
     pub fn verify(&self) -> bool {
-        verify_batched_issuance(&self.y, &self.proof)
+        verify_batched_issuance(&self.batched_y, &self.proof)
+    }
+
+    pub fn sign(&self, secret_key: &SecretKeyShare) -> Vec<SignatureShare> {
+        let mut signature_shares = Vec::new();
+        let h: G1Projective = compute_batched_h(&self.batched_y);
+        for y in &self.batched_y {
+            signature_shares.push(SignatureShare(sign_blinded_message(
+                secret_key.0,
+                h,
+                y[2],
+                y[3],
+                y[4],
+            )));
+        }
+        signature_shares
     }
 }
 
