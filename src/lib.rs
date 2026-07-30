@@ -18,7 +18,7 @@ use crate::hash::{hash_to_g1, map_to_scalar};
 use crate::issuance::{
     compute_c_m, get_challenge_issuance, issuance_homomorphism, prepare_issuance, IssuanceProof,
 };
-use crate::mint::{BatchedIssuance, mint_keygen, PublicKeyShare, Signature, SignatureShare};
+use crate::mint::{BatchedIssuance, PublicKeyShare, Signature, SignatureShare, AggregatePublicKey};
 
 pub fn pedersen_commit(m: u64, r: Scalar) -> G1Projective {
     compute_pc(Scalar::from(m), r)
@@ -70,6 +70,10 @@ impl IssuanceRequest {
         signature: &SignatureShare,
     ) -> bool {
         self.verify_signature(&pk.g2, h, &self.unblind_signature(&pk.g1, &signature.0))
+    }
+    
+    pub fn verify_blind_signature(&self, pk: &AggregatePublicKey, signature: &Signature) -> bool {
+        self.verify_signature(&pk.g2, &signature.h, &self.unblind_signature(&pk.g1, &signature.sigma))
     }
 
     fn unblind_signature(&self, g1: &[G1Projective; 4], signature: &G1Projective) -> G1Projective {
@@ -205,8 +209,9 @@ mod tests {
     use bls12_381::Scalar;
     use ff::Field;
     use rand::thread_rng;
+    use std::collections::BTreeMap;
 
-    use crate::{BatchedIssuanceRequest, IssuanceRequest, mint::mint_keygen};
+    use crate::{BatchedIssuanceRequest, IssuanceRequest, mint::mint_keygen, mint::SignatureShare, aggregate_signature_shares};
 
     #[test]
     fn test_issuance_request() {
@@ -226,15 +231,28 @@ mod tests {
         let blinding_sk = Scalar::random(&mut thread_rng());
         let amount = 1000;
         let request_index = 1;
-        let mint_id = 3;
         let first_request = IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
         let second_request =
             IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
         let mut batched_request = BatchedIssuanceRequest::new(&vec![first_request, second_request]);
 
         let batched_issuance = batched_request.prepare_batched_issuance();
-        let (_, pub_keys, sec_keys) = mint_keygen(5,7);
-        let signature_shares = batched_issuance.sign(&sec_keys[mint_id]);
-        assert!(batched_request.requests[request_index].verify_blind_signature_share(&pub_keys[mint_id], &batched_request.h, &signature_shares[request_index]));
+        let (agg_pub_keys, pub_keys, sec_keys) = mint_keygen(5,7);
+        let signature_shares = sec_keys
+            .iter()
+            .map(|sk| batched_issuance.sign(sk)[request_index].clone())
+            .collect::<Vec<SignatureShare>>();
+        for (pk, share) in pub_keys.iter().zip(signature_shares.iter()) {
+            assert!(batched_request.requests[request_index].verify_blind_signature_share(pk, &batched_request.h, &share));
+        }
+
+        let signature_shares = (1_u64..)
+            .zip(signature_shares)
+            .take(5)
+            .collect::<BTreeMap<u64, SignatureShare>>();
+
+        let signature = aggregate_signature_shares(batched_request.h, &signature_shares);
+
+        assert!(batched_request.requests[request_index].verify_blind_signature(&agg_pub_keys, &signature));
     }
 }

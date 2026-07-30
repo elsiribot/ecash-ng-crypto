@@ -1,7 +1,7 @@
 use bls12_381::{G1Projective, G2Projective, Scalar};
 use ff::Field;
 use rand::thread_rng;
-use std::array;
+use std::{array, clone};
 
 use crate::generators;
 use crate::hash::hash_g1_to_g1;
@@ -27,14 +27,13 @@ pub struct BatchedIssuance {
     pub batched_y: Vec<[G1Projective; 5]>,
     pub proof: IssuanceProof,
 }
-
+#[derive(Clone, Copy)]
 pub struct SignatureShare(pub G1Projective);
 
 pub struct Signature {
     pub h: G1Projective,
     pub sigma: G1Projective,
 }
-
 pub struct SecretKeyShare([Scalar; 4]);
 
 pub fn mint_keygen(
