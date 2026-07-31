@@ -1,12 +1,14 @@
 use bitcoin_hashes::sha256;
-use bls12_381::{G1Projective, G2Projective, Scalar};
+use bls12_381::{pairing, G1Projective, G2Projective, Scalar};
 use ff::Field;
+use group::Curve;
 use rand::thread_rng;
-use std::{array};
+use std::array;
 
 use crate::generators;
-use crate::hash::hash_g1_to_g1;
+use crate::hash::{hash_g1_to_g1, map_to_scalar};
 use crate::issuance::{compute_batched_h, verify_batched_issuance, verify_issuance, IssuanceProof};
+use crate::spend::verify_spend;
 
 pub struct AggregatePublicKey {
     pub g1: [G1Projective; 4],
@@ -22,6 +24,14 @@ pub struct Issuance {
     pub y: [G1Projective; 5],
     pub r: [G1Projective; 5],
     pub s: [Scalar; 8],
+}
+
+pub struct Spend {
+    pub p: G1Projective,
+    pub k: G2Projective,
+    pub signature: Signature,
+    pub v: G2Projective,
+    pub proof: [Scalar; 4],
 }
 
 pub struct BatchedIssuance {
@@ -41,7 +51,8 @@ pub struct ECash {
     pub signature: Signature,
     pub value: Scalar,
     pub serial: Scalar,
-    pub auth: sha256::Hash
+    pub auth: sha256::Hash,
+    pub pedersen_rand: Scalar,
 }
 
 pub fn mint_keygen(
@@ -135,6 +146,19 @@ impl BatchedIssuance {
     }
 }
 
+impl Spend {
+    pub fn verify(&self, pk: AggregatePublicKey, authentication: sha256::Hash) -> bool {
+        let message = pk.g2[0] + self.k + map_to_scalar(&authentication) * pk.g2[3] + self.v;
+
+        let p_m = pairing(&self.signature.h.to_affine(), &message.to_affine());
+        let p_s = pairing(
+            &self.signature.sigma.to_affine(),
+            &generators::ecash_g2().to_affine(),
+        );
+
+        verify_spend((self.p, self.k), self.proof, pk.g2) && (p_m == p_s)
+    }
+}
 fn sign_blinded_message(
     sk: [Scalar; 4],
     h: G1Projective,

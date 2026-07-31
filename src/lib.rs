@@ -6,8 +6,6 @@ mod issuance;
 mod mint;
 mod spend;
 
-use std::collections::BTreeMap;
-
 use bitcoin_hashes::sha256;
 use bls12_381::{pairing, G1Projective, G2Projective, Scalar};
 use ff::Field;
@@ -18,11 +16,11 @@ use crate::hash::{hash_to_g1, map_to_scalar};
 use crate::issuance::{
     compute_c_m, get_challenge_issuance, issuance_homomorphism, prepare_issuance, IssuanceProof,
 };
-use crate::mint::{BatchedIssuance, PublicKeyShare, Signature, SignatureShare, AggregatePublicKey, ECash};
+use crate::mint::{
+    AggregatePublicKey, BatchedIssuance, ECash, PublicKeyShare, Signature, SignatureShare, Spend,
+};
+use crate::spend::prepare_spend;
 
-pub fn pedersen_commit(m: u64, r: Scalar) -> G1Projective {
-    compute_pc(Scalar::from(m), r)
-}
 #[derive(Copy, Clone)]
 pub struct IssuanceRequest {
     m_1: Scalar,
@@ -38,6 +36,10 @@ pub struct BatchedIssuanceRequest {
     requests: Vec<IssuanceRequest>,
     batched_y: Vec<[G1Projective; 5]>,
     h: G1Projective,
+}
+pub struct SpendRequest {
+    e_cash: ECash,
+    re_blinding: [Scalar; 2],
 }
 
 impl IssuanceRequest {
@@ -71,9 +73,13 @@ impl IssuanceRequest {
     ) -> bool {
         self.verify_signature(&pk.g2, h, &self.unblind_signature(&pk.g1, &signature.0))
     }
-    
+
     pub fn verify_blind_signature(&self, pk: &AggregatePublicKey, signature: &Signature) -> bool {
-        self.verify_signature(&pk.g2, &signature.h, &self.unblind_signature(&pk.g1, &signature.sigma))
+        self.verify_signature(
+            &pk.g2,
+            &signature.h,
+            &self.unblind_signature(&pk.g1, &signature.sigma),
+        )
     }
 
     fn unblind_signature(&self, g1: &[G1Projective; 4], signature: &G1Projective) -> G1Projective {
@@ -118,13 +124,14 @@ impl IssuanceRequest {
         assert!(self.m_3 == map_to_scalar(&auth));
 
         ECash {
-            signature: Signature { 
+            signature: Signature {
                 h: signature.h,
-                sigma: unblinded_signature 
+                sigma: unblinded_signature,
             },
             value: self.m_1,
             serial: self.m_2,
-            auth: auth
+            pedersen_rand: self.r_p,
+            auth: auth,
         }
     }
 }
@@ -192,37 +199,39 @@ impl BatchedIssuanceRequest {
     }
 }
 
-pub fn aggregate_signature_shares(
-    h: G1Projective,
-    shares: &BTreeMap<u64, SignatureShare>,
-) -> Signature {
-    Signature {
-        h,
-        sigma: lagrange_multipliers(shares.keys().cloned().map(Scalar::from).collect())
-            .into_iter()
-            .zip(shares.values())
-            .map(|(lagrange_multiplier, share)| lagrange_multiplier * share.0)
-            .reduce(|a, b| a + b)
-            .expect("We have at least one share"),
+impl SpendRequest {
+    fn new(e_cash: &ECash) -> Self {
+        let rand = Scalar::random(&mut thread_rng());
+        let rand_prime = Scalar::random(&mut thread_rng());
+        let blinded_signature = Signature {
+            sigma: e_cash.signature.sigma * rand + e_cash.signature.h * rand * rand_prime,
+            h: e_cash.signature.h * rand,
+        };
+        let blinded_e_cash = ECash {
+            signature: blinded_signature,
+            ..*e_cash
+        };
+        assert!(blinded_e_cash.signature.h == e_cash.signature.h * rand);
+        SpendRequest {
+            e_cash: blinded_e_cash,
+            re_blinding: [rand, rand_prime],
+        }
     }
-}
-
-fn lagrange_multipliers(scalars: Vec<Scalar>) -> Vec<Scalar> {
-    scalars
-        .iter()
-        .map(|i| {
-            scalars
-                .iter()
-                .filter(|j| *j != i)
-                .map(|j| j * (j - i).invert().expect("We filtered the case j == i"))
-                .reduce(|a, b| a * b)
-                .expect("We have at least one share")
-        })
-        .collect()
-}
-
-fn compute_pc(m: Scalar, r: Scalar) -> G1Projective {
-    m * generators::pedersen_g() + r * generators::pedersen_h()
+    pub fn prepare_spend(self, pk: [G2Projective; 4]) -> Spend {
+        let ((p, k), proof) = prepare_spend(
+            self.e_cash.value,
+            self.e_cash.serial,
+            self.e_cash.pedersen_rand,
+            pk,
+        );
+        Spend {
+            p: p,
+            k: k,
+            signature: self.e_cash.signature,
+            v: generators::ecash_g2() * self.re_blinding[1],
+            proof: proof,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,7 +242,11 @@ mod tests {
     use rand::thread_rng;
     use std::collections::BTreeMap;
 
-    use crate::{BatchedIssuanceRequest, IssuanceRequest, mint::mint_keygen, mint::SignatureShare, aggregate_signature_shares};
+    use crate::{
+        issuance::aggregate_signature_shares,
+        mint::{mint_keygen, SignatureShare},
+        BatchedIssuanceRequest, IssuanceRequest, SpendRequest,
+    };
 
     #[test]
     fn test_issuance_request() {
@@ -260,13 +273,19 @@ mod tests {
         let mut batched_request = BatchedIssuanceRequest::new(&vec![first_request, second_request]);
 
         let batched_issuance = batched_request.prepare_batched_issuance();
-        let (agg_pub_keys, pub_keys, sec_keys) = mint_keygen(5,7);
+        let (agg_pub_keys, pub_keys, sec_keys) = mint_keygen(5, 7);
         let signature_shares = sec_keys
             .iter()
             .map(|sk| batched_issuance.sign(sk)[request_index].clone())
             .collect::<Vec<SignatureShare>>();
         for (pk, share) in pub_keys.iter().zip(signature_shares.iter()) {
-            assert!(batched_request.requests[request_index].verify_blind_signature_share(pk, &batched_request.h, &share));
+            assert!(
+                batched_request.requests[request_index].verify_blind_signature_share(
+                    pk,
+                    &batched_request.h,
+                    &share
+                )
+            );
         }
 
         let signature_shares = (1_u64..)
@@ -276,8 +295,59 @@ mod tests {
 
         let signature = aggregate_signature_shares(batched_request.h, &signature_shares);
 
-        assert!(batched_request.requests[request_index].verify_blind_signature(&agg_pub_keys, &signature));
+        assert!(batched_request.requests[request_index]
+            .verify_blind_signature(&agg_pub_keys, &signature));
 
-        let _e_cash_note = batched_request.requests[request_index].finalize_issuance(&agg_pub_keys, &signature, auth);
-    }    
+        let _e_cash_note = batched_request.requests[request_index].finalize_issuance(
+            &agg_pub_keys,
+            &signature,
+            auth,
+        );
+    }
+    #[test]
+    fn test_spend() {
+        let blinding_sk = Scalar::random(&mut thread_rng());
+        let amount = 1000;
+        let auth = sha256::Hash::hash(&[0; 32]);
+        let request_index = 1;
+        let first_request = IssuanceRequest::new(amount, auth, blinding_sk);
+        let second_request =
+            IssuanceRequest::new(amount, sha256::Hash::hash(&[0; 32]), blinding_sk);
+        let mut batched_request = BatchedIssuanceRequest::new(&vec![first_request, second_request]);
+
+        let batched_issuance = batched_request.prepare_batched_issuance();
+        let (agg_pub_keys, pub_keys, sec_keys) = mint_keygen(5, 7);
+        let signature_shares = sec_keys
+            .iter()
+            .map(|sk| batched_issuance.sign(sk)[request_index].clone())
+            .collect::<Vec<SignatureShare>>();
+        for (pk, share) in pub_keys.iter().zip(signature_shares.iter()) {
+            assert!(
+                batched_request.requests[request_index].verify_blind_signature_share(
+                    pk,
+                    &batched_request.h,
+                    &share
+                )
+            );
+        }
+
+        let signature_shares = (1_u64..)
+            .zip(signature_shares)
+            .take(5)
+            .collect::<BTreeMap<u64, SignatureShare>>();
+
+        let signature = aggregate_signature_shares(batched_request.h, &signature_shares);
+
+        assert!(batched_request.requests[request_index]
+            .verify_blind_signature(&agg_pub_keys, &signature));
+
+        let e_cash_note = batched_request.requests[request_index].finalize_issuance(
+            &agg_pub_keys,
+            &signature,
+            auth,
+        );
+        let spend_request = SpendRequest::new(&e_cash_note);
+        let spend = spend_request.prepare_spend(agg_pub_keys.g2);
+        assert!(spend.verify(agg_pub_keys, auth));
+    }
 }

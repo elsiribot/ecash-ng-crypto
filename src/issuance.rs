@@ -1,11 +1,15 @@
-use crate::hash::hash_to_g1;
 use bitcoin_hashes::sha256;
 use bls12_381::{G1Projective, Scalar};
 use ff::Field;
 use group::Curve;
 use rand::thread_rng;
 use std::array;
+use std::collections::BTreeMap;
 use std::io::Write;
+
+use crate::generators::{pedersen_g, pedersen_h};
+use crate::hash::hash_to_g1;
+use crate::mint::{Signature, SignatureShare};
 
 pub struct IssuanceProof {
     pub r: [G1Projective; 5],
@@ -17,7 +21,7 @@ pub fn issuance_homomorphism(
     h: G1Projective,
 ) -> ([G1Projective; 5], [Scalar; 8]) {
     let rho = rho.unwrap_or(array::from_fn(|_| Scalar::random(&mut thread_rng())));
-    let pc = crate::compute_pc(rho[0], rho[3]);
+    let pc = compute_pc(rho[0], rho[3]);
     let c_m = compute_c_m(rho[0], rho[1], rho[2], rho[4]);
     let c_1 = compute_c_k(rho[0], rho[5], h);
     let c_2 = compute_c_k(rho[1], rho[6], h);
@@ -105,7 +109,7 @@ pub fn prepare_issuance(
     r_3: Scalar,
     h: G1Projective,
 ) -> [G1Projective; 5] {
-    let pc = crate::compute_pc(m_1, r_p);
+    let pc = compute_pc(m_1, r_p);
     let c_m = compute_c_m(m_1, m_2, m_3, r_m);
 
     let c_1 = compute_c_k(m_1, r_1, h);
@@ -139,4 +143,40 @@ pub fn compute_batched_h(batched_y: &Vec<[G1Projective; 5]>) -> G1Projective {
         acc
     });
     hash_to_g1(&batched_c_m_bytes)
+}
+
+pub fn aggregate_signature_shares(
+    h: G1Projective,
+    shares: &BTreeMap<u64, SignatureShare>,
+) -> Signature {
+    Signature {
+        h,
+        sigma: lagrange_multipliers(shares.keys().cloned().map(Scalar::from).collect())
+            .into_iter()
+            .zip(shares.values())
+            .map(|(lagrange_multiplier, share)| lagrange_multiplier * share.0)
+            .reduce(|a, b| a + b)
+            .expect("We have at least one share"),
+    }
+}
+
+fn lagrange_multipliers(scalars: Vec<Scalar>) -> Vec<Scalar> {
+    scalars
+        .iter()
+        .map(|i| {
+            scalars
+                .iter()
+                .filter(|j| *j != i)
+                .map(|j| j * (j - i).invert().expect("We filtered the case j == i"))
+                .reduce(|a, b| a * b)
+                .expect("We have at least one share")
+        })
+        .collect()
+}
+
+fn compute_pc(m: Scalar, r: Scalar) -> G1Projective {
+    m * pedersen_g() + r * pedersen_h()
+}
+pub fn pedersen_commit(m: u64, r: Scalar) -> G1Projective {
+    compute_pc(Scalar::from(m), r)
 }
