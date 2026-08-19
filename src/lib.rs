@@ -5,6 +5,7 @@ mod hash;
 mod issuance;
 mod mint;
 mod spend;
+mod rp;
 
 use bitcoin_hashes::sha256;
 use bls12_381::{pairing, G1Projective, G2Projective, Scalar};
