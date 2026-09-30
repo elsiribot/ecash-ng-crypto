@@ -1,0 +1,34 @@
+% Imposes Fedimint_Blinded_eCash_bw_a5.pdf two-up on landscape A4 in cut-and-stack
+% order: sheet k carries page k on the left and page k + N/2 on the right, so after
+% cutting every sheet in half the right-hand stack goes under the left-hand stack.
+% A dashed line marks the cut. Build via `make` in this directory.
+\documentclass{article}
+\usepackage[a4paper,landscape,margin=0pt]{geometry}
+\usepackage{pdfpages}
+\usepackage{tikz}
+\usepackage{pgffor}
+\pagestyle{empty}
+
+\pdfximage{Fedimint_Blinded_eCash_bw_a5.pdf}
+\newcount\actual \actual=\pdflastximagepages
+\newcount\npages \npages=\actual
+\ifodd\npages \advance\npages by 1 \fi   % pad to an even count; the missing page becomes a blank
+\newcount\half \half=\npages \divide\half by 2
+
+\newcommand{\cutline}{%
+  \begin{tikzpicture}[remember picture,overlay]
+    \draw[gray,dashed,thin] (current page.north) -- (current page.south);
+  \end{tikzpicture}}
+
+\begin{document}
+\foreach \k in {1,...,\the\half}{%
+  \pgfmathtruncatemacro{\r}{\k+\half}%
+  \ifnum\r>\actual
+    \includepdf[pages={\k,{}},nup=2x1,noautoscale=true,delta=0pt 0pt,
+                pagecommand={\cutline}]{Fedimint_Blinded_eCash_bw_a5.pdf}%
+  \else
+    \includepdf[pages={\k,\r},nup=2x1,noautoscale=true,delta=0pt 0pt,
+                pagecommand={\cutline}]{Fedimint_Blinded_eCash_bw_a5.pdf}%
+  \fi
+}
+\end{document}
