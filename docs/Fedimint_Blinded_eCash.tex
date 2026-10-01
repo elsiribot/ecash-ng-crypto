@@ -19,10 +19,12 @@
 % layout-dependent table widths and sizes
 \ifafive
   \newcommand{\wAttr}{4.6cm}\newcommand{\wSym}{5.2cm}\newcommand{\wSec}{6.8cm}
+  \newcommand{\wTwo}{7.0cm}
   \newcommand{\tabsize}{\small}\newcommand{\legendsize}{\footnotesize}
   \newcommand{\annot}[2]{\text{\small #2}}   % short equation annotations
 \else
   \newcommand{\wAttr}{7.5cm}\newcommand{\wSym}{7.4cm}\newcommand{\wSec}{10.5cm}
+  \newcommand{\wTwo}{11.0cm}
   \newcommand{\tabsize}{}\newcommand{\legendsize}{\small}
   \newcommand{\annot}[2]{\text{#1}}
 \fi
@@ -31,6 +33,9 @@
 \usepackage{booktabs}
 \usepackage{array}
 \usepackage{longtable}
+\usepackage{amsthm}
+\newtheorem{lemma}{Lemma}
+\newtheorem{definition}{Definition}
 \usepackage{enumitem}
 \usepackage{microtype}
 \usepackage[most]{tcolorbox}
@@ -86,12 +91,35 @@
   boxrule=0.5pt,left=6pt,right=6pt,top=4pt,bottom=4pt,arc=2pt,
   fonttitle=\bfseries,title={#1}}
 
-\title{Fedimint Confidential eCash}
+\title{Fedimint Confidential eCash\\[4pt]\large Threshold-issued, value-hiding, unlinkable notes from Pointcheval--Sanders signatures}
 \author{Gazelle}
 \date{July 2026 \\ \small revised September 2026}
 
 \begin{document}
 \maketitle
+
+\begin{abstract}
+Fedimint issues eCash notes from a federation of mints using blind signatures,
+which hides \emph{who} spends a note but not \emph{how much} it is worth: every
+note carries a public denomination. We describe a confidential variant in which
+the amount is a hidden attribute of a threshold-issued anonymous credential. A
+note is a Pointcheval--Sanders signature over three hidden attributes (amount,
+serial secret, spend condition), issued blindly by any $t$ of $n$ mints following
+the Coconut construction in the Pedersen-commitment form used by Nym; the amount
+is additionally carried in a Pedersen commitment so that transactions can be
+balanced homomorphically and range-proven with Bulletproofs. Spending shows a
+re-randomised signature together with a deterministic nullifier and a short
+$\Sigma$-proof, so that spends are unlinkable to issuance and double spends are
+detected by nullifier equality. We fix the notation, explain the purpose of
+every element of the construction, give the security model and proof sketches,
+describe how notes compose into transactions, and analyse an amortised
+$\Sigma$-proof that keeps the issuance proof at a constant 496 bytes for any
+number of notes. We show that the amortisation as implemented shares one
+signature base across a batch and thereby enables an affine-combination forgery
+of PS signatures; we give a partially amortised variant with per-note bases
+that avoids it at about 192 bytes per note. We report proof and transaction
+sizes and timings of a Rust prototype over BLS12-381.
+\end{abstract}
 
 \section{Introduction}
 
@@ -119,42 +147,121 @@ Finally, the construction should be \textbf{practical}, with cryptographic
 proofs and transaction sizes that remain compact and computational costs that
 are sufficiently low for deployment in real-world payment systems.
 
-This document introduces the concept of confidential blind eCash generated
-within a federation and discusses the cryptographic techniques that enable
-both transaction privacy and value confidentiality while maintaining strong
-security guarantees and practical efficiency. Section~\ref{sec:notation}
-fixes the notation, Section~\ref{sec:scheme} explains the scheme for a single
-note, and only afterwards Section~\ref{sec:batching} introduces the batching
-of issuance requests as an optimisation on top of it.
+Fedimint today meets the first three goals with blind BLS signatures over a
+fixed set of denominations~\cite{fedimint}: a note is a signature on a random
+serial, and its value is the public denomination of the key that signed it.
+Hiding the value therefore needs a different primitive: a signature on a
+\emph{hidden} amount that can still be verified, balanced against other notes,
+and bounded to a legal range. Anonymous credentials provide exactly this, and
+the Coconut construction~\cite{coconut} makes them threshold-issuable, which
+matches a federation of mints.
 
-\section{Threshold Anonymous Credentials}
+\paragraph{Contributions.} This paper describes such a confidential federated
+eCash scheme and the prototype that implements it. Concretely, it
+\begin{itemize}[nosep]
+  \item presents the construction with a complete, typed notation
+        (Section~\ref{sec:notation}) and explains, for every element of the
+        issuance request, the signature and the spend, which security property
+        it exists for (Section~\ref{sec:scheme});
+  \item states the system model, the threat model and the security goals
+        (Section~\ref{sec:model}) and gives proof sketches reducing each goal to
+        standard assumptions (Section~\ref{sec:analysis});
+  \item describes how notes compose into balanced, range-proven transactions
+        and how double spending is detected (Section~\ref{sec:tx});
+  \item analyses the amortised issuance proof used by the prototype
+        (Section~\ref{sec:batching}): it proves a soundness bound for the
+        batched $\Sigma$-protocol, shows that sharing one signature base across
+        a batch enables an affine-combination forgery of the underlying
+        signatures, and proposes a partially amortised variant with per-note
+        bases that removes the weakness at a modest size cost;
+  \item reports proof sizes, transaction sizes and measured timings of the
+        Rust prototype (Section~\ref{sec:perf}) and lists where the prototype
+        deviates from the description (Section~\ref{sec:impl}).
+\end{itemize}
+Section~\ref{sec:background} reviews the building blocks and related work,
+Section~\ref{sec:open} collects open problems, and Appendix~\ref{app:sigma}
+develops the $\Sigma$-protocol for linear maps that both proofs of the scheme
+instantiate.
 
-This project builds upon a modified version of the Coconut credential
-scheme~\cite{coconut}, as adapted and deployed by Nym
-Technologies~\cite{nym,nymcode}. Coconut is a threshold anonymous credential
-system that enables users to obtain credentials from multiple authorities while
-preserving privacy through selective disclosure and unlinkability. The
-underlying signature is the Pointcheval--Sanders (PS) signature~\cite{ps16},
-whose signing operation is linear in the secret key and can therefore be
-distributed with Shamir secret sharing, and whose signatures can be
-re-randomised so that a credential can be shown without being recognised.
+\section{Background and Related Work}
+\label{sec:background}
 
-Nym's variant differs from the original Coconut construction in the issuance
-protocol: instead of ElGamal-encrypting the hidden attributes for the
-authorities, the user sends Pedersen commitments to them in a base derived from
-a hash. This removes the user's ElGamal key pair, shrinks the request, and
-makes unblinding a matter of subtracting public-key material. Nym also
-publishes the verification key in both source groups of the pairing so that
-unblinding can be carried out in $\GG{1}$. The following sections describe the
-credential structure adopted in this project, which follows Nym's variant, and
-highlight where it deviates from it.
+\subsection{Blind-signature eCash and Fedimint}
 
-At a high level, a credential consists of a set of cryptographic commitments to
-user attributes together with a threshold signature issued jointly by a
-committee of authorities. The commitments allow users to prove statements about
-their attributes in zero knowledge without revealing the attributes themselves,
-while the threshold signature guarantees that the credential has been
-legitimately issued even if only a quorum of authorities participates.
+Chaum's untraceable payments~\cite{chaum83} introduced the pattern that all
+later eCash follows: a user obtains a signature on a blinded message, unblinds
+it, and later presents the signature, which the issuer cannot connect to the
+blinded message it signed. Fedimint~\cite{fedimint} applies this pattern with
+threshold BLS signatures~\cite{bls01,boldyreva03}: a federation of $n$
+guardians holds Shamir shares of a signing key per denomination, a user
+submits a blinded serial, and any $t$ guardians' signature shares combine into
+a note. Values are public because the denomination is the key. A transaction
+spends notes as inputs and requests new notes as outputs, and the federation
+checks that the denominations balance. The scheme in this paper keeps the
+federation, the threshold issuance and the transaction structure, and replaces
+the per-denomination key by a single key over hidden attributes.
+
+\subsection{Pointcheval--Sanders signatures and Coconut}
+
+Camenisch--Lysyanskaya signatures~\cite{cl04} made it possible to sign
+committed messages and to prove possession of a signature in zero knowledge,
+the basis of anonymous credentials. Pointcheval and Sanders~\cite{ps16} gave a
+much shorter scheme with the same features in type-3 pairing groups: a
+signature is two elements of $\GG{1}$ regardless of the number of messages,
+signing is linear in both the key and the messages, and signatures can be
+re-randomised. Its security was first argued under an interactive LRSW-type
+assumption~\cite{lrsw99} and later under the non-interactive
+$q$-MSDH-1 assumption~\cite{ps18}. Coconut~\cite{coconut} observed that the
+linearity in the key allows threshold issuance by Shamir sharing and Lagrange
+interpolation in the exponent, provided all authorities use the same signature
+base; it derives that base by hashing a commitment supplied by the user,
+following the hash-to-base idea of BLS. Coconut carries the hidden attributes
+to the authorities as ElGamal ciphertexts of $\K{m_j}\Go{B}$.
+
+\subsection{Nym's variant}
+
+Nym Technologies deploys Coconut credentials in its network~\cite{nym} and,
+for its zk-nym bandwidth credentials, a compact divisible eCash scheme built on
+the same signature~\cite{rial23,nymcode}. Their issuance protocol replaces the
+ElGamal ciphertexts by Pedersen commitments $\Go{C_j} = \K{m_j}\Go{B} + \K{o_j}\Go{G_1}$
+in the hashed base, with the verification key published in both source groups
+so that the user can strip the blinding term with public information only.
+This removes the user's ElGamal key pair and shortens the request. The scheme
+of this paper follows Nym's issuance protocol and attribute layout but uses the
+credential differently at spend time: Nym blinds the attribute term of the
+verification equation with fresh randomness because it is not a nullifier,
+whereas here that term is deliberately deterministic (Section~\ref{sec:spend}).
+
+\subsection{Confidential amounts}
+
+Hiding amounts behind Pedersen commitments~\cite{pedersen91} and balancing a
+transaction by the homomorphic sum of its commitments is the Confidential
+Transactions design~\cite{maxwell15}. Because commitments are over a prime
+field, a balanced transaction can still create value through wrap-around
+unless every output is proven to lie in a small range; Bulletproofs~\cite{bulletproofs}
+provide such range proofs with size logarithmic in the bit length and
+aggregatable across outputs without a trusted setup. We reuse both ideas and
+bind the committed amount to the signed attribute with the issuance proof.
+
+\subsection{Nullifiers and compact eCash}
+
+Detecting double spending of an anonymous token by publishing a deterministic
+function of a hidden secret, the \emph{nullifier}, goes back to compact
+eCash~\cite{chl05} and is used by Zcash~\cite{zcash}. Our nullifier
+$\Gt{K'} = \K{m_1}\Gt{X_1} + \K{m_2}\Gt{X_2}$ is the hidden-attribute part of the
+PS verification equation itself, so it costs nothing extra to verify and is
+tied to the signature by the pairing check rather than by an additional proof.
+
+\subsection{Batch verification and amortised proofs}
+
+Checking many linear relations at once through a random linear combination is
+the small-exponents batch verification of Bellare, Garay and
+Rabin~\cite{bgr98}. Applied inside a $\Sigma$-protocol it lets a prover answer
+many instances of the same linear map with one response, which is the
+amortisation used in Section~\ref{sec:batching}. Logarithmic-size alternatives
+exist, notably the inner-product folding of Bulletproofs and compressed
+$\Sigma$-protocols~\cite{acf21}; they trade prover and verifier work for size
+and are not used here.
 
 \section{Notation and Setting}
 \label{sec:notation}
@@ -261,6 +368,30 @@ $\Go{Y_j}$ is Nym's $\beta_{g_1,j}$~\cite{nymcode}.
 Section~\ref{sec:threshold} replaces the single issuer by a $t$-of-$n$
 federation whose \emph{aggregate} key has exactly this shape.
 
+\subsection{Assumptions}
+\label{sec:assumptions}
+
+The security arguments of Section~\ref{sec:analysis} rely on the following
+standard assumptions, all believed to hold in BLS12-381.
+\begin{description}[nosep,leftmargin=1.2em]
+\item[DL.] The discrete-logarithm problem is hard in $\GG{1}$ and $\GG{2}$. It
+  makes the Pedersen commitments binding: an opening of $\Go{P}$ to two
+  different amounts yields the discrete logarithm of $\Go{H_p}$ to base $\Go{G_p}$.
+\item[DDH / SXDH.] Decisional Diffie--Hellman is hard in $\GG{1}$ and in
+  $\GG{2}$ separately (the symmetric external Diffie--Hellman assumption),
+  which is plausible precisely because the pairing is type-3. It makes
+  re-randomised signatures unlinkable and hides $\K{m_1}$ inside $\Gt{K'}$.
+\item[PS unforgeability.] Pointcheval--Sanders signatures are existentially
+  unforgeable under chosen-message attack. This holds under the interactive
+  LRSW-type assumption of~\cite{ps16} or, for signatures with $q$ messages,
+  under the $q$-MSDH-1 assumption of~\cite{ps18}. We note in
+  Section~\ref{sec:sharedh} that the assumption presupposes a fresh base per
+  signature.
+\item[Random oracles.] $\Hg$ and $\Hs$ are modelled as random oracles. $\Hg$
+  gives every note a base with unknown discrete logarithm; $\Hs$ makes the
+  Fiat--Shamir transform sound.
+\end{description}
+
 \subsection{Summary of symbols}
 
 Table~\ref{tab:symbols} lists every symbol used in the remainder of the
@@ -324,6 +455,73 @@ Symbol & Type & Meaning \\
 \end{table}
 \fi
 
+
+\section{System Model and Security Goals}
+\label{sec:model}
+
+\subsection{Parties and threat model}
+
+There are $n$ \emph{mints} (Fedimint guardians), each holding a share of the
+federation's signing key, and any number of \emph{users}. A mint acts both as
+an issuer, when it signs a blinded request, and as a verifier, when it checks a
+spend as part of validating a transaction. Mints run a consensus protocol; we
+treat it as a black box that delivers the same transactions in the same order
+to every honest mint and bounds the size of a transaction.
+
+An adversary may corrupt up to $t-1$ mints and any number of users, adaptively
+but statically within one issuance. Corrupted parties collude and share all
+state, including key shares. Honest mints run the protocol as specified and
+keep their key shares secret. The network is under adversarial control; all
+messages between users and mints are visible to the adversary. We do not model
+denial of service.
+
+\subsection{Syntax}
+
+The scheme consists of the following algorithms, which
+Section~\ref{sec:scheme} instantiates.
+\begin{description}[nosep,leftmargin=1.2em]
+\item[$\mathsf{KeyGen}(t,n)$] outputs an aggregate public key $\mathsf{pk}$,
+  public key shares $\mathsf{pk}_1,\dots,\mathsf{pk}_n$ and secret key shares
+  $\mathsf{sk}_1,\dots,\mathsf{sk}_n$.
+\item[$\mathsf{Request}(\K{v},\auth)$] run by a user with amount $\K{v}$ and
+  spend condition $\auth$; outputs a public request $\mathsf{req}$ and private
+  state $\mathsf{st}$.
+\item[$\mathsf{Sign}(\mathsf{sk}_i,\mathsf{req})$] run by mint $i$; verifies
+  $\mathsf{req}$ and outputs a blinded signature share $\Go{\widetilde{\sigma}_i}$
+  or $\bot$.
+\item[$\mathsf{Finalize}(\mathsf{st},\{\Go{\widetilde{\sigma}_i}\}_{i\in S})$]
+  run by the user with shares from a set $S$ of $t$ mints; outputs a note
+  $\mathsf{note}$ or $\bot$.
+\item[$\mathsf{Spend}(\mathsf{note})$] outputs a spend $\mathsf{sp}$ and the
+  nullifier $\Gt{K'}$.
+\item[$\mathsf{Verify}(\mathsf{pk},\mathsf{sp},\auth)$] outputs $0$ or $1$.
+\end{description}
+Amount commitments appear in both $\mathsf{req}$ and $\mathsf{sp}$ so that the
+transaction layer (Section~\ref{sec:tx}) can balance them.
+
+\subsection{Security goals}
+
+\begin{description}[nosep,leftmargin=1.2em]
+\item[Correctness.] A note obtained from $t$ honest mints on an honest request
+  verifies, and its spend reveals the nullifier of that note.
+\item[Unforgeability (balance).] No adversary corrupting fewer than $t$ mints
+  can produce $k$ valid spends with pairwise distinct nullifiers whose committed
+  amounts sum to more than the amounts of the notes issued to it by the honest
+  mints. This covers creating notes from nothing, increasing a note's value,
+  and spending a note more than once.
+\item[Blindness.] The mints learn nothing about the attributes
+  $(\K{m_1},\K{m_2},\K{m_3})$ from an issuance beyond what the range proof
+  states.
+\item[Unlinkability.] Given two spends and two issuance transcripts, an
+  adversary, even one holding all key shares, cannot tell which spend came from
+  which issuance better than by guessing.
+\item[Double-spend detection.] Two spends of the same note have the same
+  nullifier; two spends of different notes have different nullifiers except
+  with negligible probability.
+\item[Value confidentiality.] An observer of all transcripts learns nothing
+  about a note's amount beyond the range proven at issuance and the balance
+  relations of the transactions it appears in.
+\end{description}
 
 \section{The Scheme for a Single Note}
 \label{sec:scheme}
@@ -459,7 +657,7 @@ linear map $\varphi_{\Go{B}} : \F^8 \to \GG{1}^5$,
   = \vv{C}.
   \label{eq:phi}
 \end{equation}
-The witness is
+The witness, known only to the user and never transmitted, is
 \[
   \vv{w} = (\K{m_1},\K{m_2},\K{m_3},\K{r_p},\K{r_m},\K{r_1},\K{r_2},\K{r_3}) \in \F^8 .
 \]
@@ -467,7 +665,8 @@ Note that $\varphi_{\Go{B}}$ depends on $\Go{B}$, which the verifier recomputes
 from the second component of $\vv{C}$; the map is fixed once $\Go{C_m}$ is.
 
 The user proves knowledge of a preimage with the standard $\Sigma$-protocol
-for linear maps (Schnorr's protocol generalised to a vector-valued linear map),
+for linear maps (Appendix~\ref{app:sigma}; Schnorr's protocol generalised to a
+vector-valued linear map),
 made non-interactive with the Fiat--Shamir transform under the domain tag
 $\dtag_{\mathrm{iss}} = {}$\texttt{FEDIMINT\_\allowbreak ECASH\_\allowbreak CHALLENGE\_\allowbreak ISSUANCE}:
 \begin{equation}
@@ -569,7 +768,8 @@ $(\Go{B},\Go{\sigma})$ together with $(\K{m_1},\K{m_2},\auth)$ is the eCash note
 
 Nothing above requires a single issuer, because~\eqref{eq:blindsign} is
 $\F$-linear in the secret key $(\K{x_0},\dots,\K{x_3})$. The standard
-threshold-BLS transformation therefore applies component-wise.
+threshold-BLS transformation~\cite{boldyreva03} therefore applies
+component-wise, with Shamir sharing~\cite{shamir79} of each key component.
 
 \paragraph{Key sharing.}
 Each $\K{x_j}$ is Shamir-shared: pick random polynomials $f_j \in \F[X]$ of
@@ -724,10 +924,17 @@ $e(\Go{\sigma'},\Gt{G_2})$ and recover the same $\GG{T}$ values as if
 $\K{r'} = 0$. Under this reading $\Gt{V}$ adds $96$ bytes and one scalar
 multiplication but no additional hiding; the unlinkability of a spend rests on
 the re-randomisation by $\K{r}$ and on the fresh $\K{r'_p}$. Whether $\Gt{V}$
-should be kept is an open question (Section~\ref{sec:future}).
+should be kept is an open question (Section~\ref{sec:open}).
 
-\subsection{Security properties}
+\subsection{Summary of properties}
 \label{sec:security}
+
+Table~\ref{tab:props} maps each goal of Section~\ref{sec:model} to the elements
+that provide it; Section~\ref{sec:analysis} gives the arguments.
+
+\begin{table}[htbp]
+\caption{Where each security property comes from.}
+\label{tab:props}
 
 \begin{center}
 \tabsize
@@ -744,6 +951,80 @@ Offline spending & Verification~\eqref{eq:spendverify} needs only the aggregate 
 \bottomrule
 \end{tabular}
 \end{center}
+\end{table}
+
+\section{Transactions}
+\label{sec:tx}
+
+A note on its own is a credential; eCash arises when notes are spent and
+re-issued inside transactions validated by the federation. This section
+describes the intended transaction layer. It is not part of the prototype, but
+the scheme's elements were chosen for it.
+
+\subsection{Structure and balance}
+
+A transaction has $a$ inputs, each a spend $\mathsf{sp}_k$ of
+Section~\ref{sec:spend} carrying an amount commitment $\Go{P'_k}$, and $b$
+outputs, each an issuance request of Section~\ref{sec:request} carrying an
+amount commitment $\Go{P_\ell}$, together with a public fee $\K{f} \ge 0$. The
+spender additionally reveals the \emph{excess blinding}
+\begin{equation}
+  \K{\delta} \;=\; \sum_{k=1}^{a} \K{r'_{p,k}} - \sum_{\ell=1}^{b} \K{r_{p,\ell}} \;\in \F,
+  \label{eq:excess}
+\end{equation}
+and the mints check
+\begin{equation}
+  \sum_{k=1}^{a} \Go{P'_k} \;\eqq\; \sum_{\ell=1}^{b} \Go{P_\ell} + \K{f}\,\Go{G_p} + \K{\delta}\,\Go{H_p}.
+  \label{eq:balance}
+\end{equation}
+By the homomorphism of Pedersen commitments, \eqref{eq:balance} holds if and
+only if $\sum_k \K{m_{1,k}} = \sum_\ell \K{m_{1,\ell}} + \K{f}$ in $\F$ or the
+spender has found a discrete-logarithm relation between $\Go{G_p}$ and
+$\Go{H_p}$. Revealing $\K{\delta}$ leaks nothing about the individual amounts
+because each $\K{r_{p,\ell}}$ is uniform. Peg-ins and peg-outs are the cases
+$a = 0$ and $b = 0$ respectively, with the on-chain amount taking the place of
+$\K{f}$ as a public term; their Bitcoin-side handling is unchanged from
+Fedimint and not discussed here.
+
+\subsection{Range proofs}
+
+Equation~\eqref{eq:balance} is over $\F$, so it is satisfied by an output
+committing to $2^{64}$ and another committing to $p - 2^{64} + \K{v}$. Every
+output therefore carries a Bulletproof that its amount lies in $[0, 2^{64})$;
+the $b$ proofs aggregate into one of size $O(\log b)$. Inputs need no range
+proof: their amounts were range-proven when they were issued, and the issuance
+proof~\eqref{eq:phi} ties the range-proven commitment to the signed attribute,
+while the spend proof~\eqref{eq:psi} and the pairing
+check~\eqref{eq:spendverify} tie the signed attribute to $\Go{P'_k}$. This
+chain is exactly what the shared-base weakness of Section~\ref{sec:sharedh}
+breaks, because it lets a user obtain a signature on an amount that was never
+range-proven.
+
+\subsection{Validation and the nullifier set}
+
+To validate a transaction, every mint
+\begin{enumerate}[nosep]
+  \item verifies each input with $\mathsf{Verify}$, i.e.\ the $\psi$-proof and
+        the pairing check~\eqref{eq:spendverify};
+  \item checks that no input nullifier $\Gt{K'_k}$ is in the set $N$ of
+        nullifiers seen so far, and that the $a$ input nullifiers are pairwise
+        distinct;
+  \item verifies the issuance proof and the range proof of the outputs;
+  \item checks the balance~\eqref{eq:balance}.
+\end{enumerate}
+If all checks pass the transaction is accepted by consensus, every mint adds
+the input nullifiers to $N$ and signs the outputs with its key share. The set
+$N$ grows by $96$ bytes per spent note and is the only state the scheme needs
+beyond the key shares; it can be pruned once a key is retired.
+
+\subsection{Offline spending}
+
+Steps 1, 3 and 4 need only the aggregate public key, so a payee can check a
+payment without the federation. Only step 2 needs the shared state $N$, so an
+offline payee accepts the risk that the same note is spent elsewhere before the
+transaction reaches the federation. This is the usual trade-off of offline
+eCash; the scheme does not identify double spenders after the fact, it only
+rejects the second spend.
 
 \section{Batching Issuance Requests}
 \label{sec:batching}
@@ -760,6 +1041,7 @@ protocol when batching is applied, both for the proofs and for the credential
 scheme itself; see Section~\ref{sec:sharedh}.
 
 \subsection{Batched issuance proof}
+\label{sec:batchproof}
 
 Suppose the user requests $n$ notes, $i = 1,\dots,n$, with witnesses
 $\vv{w}_i \in \F^8$ and statements
@@ -800,20 +1082,42 @@ checks
   $\varphi_{\Go{B}}(\vv{s}) = \sum_i \varphi_{\Go{B}}(\vv{\rho}_i) + \sum_i \K{\gamma_i}\,\varphi_{\Go{B}}(\vv{w}_i) = \vv{R} + \sum_i \K{\gamma_i}\vv{C}_i$.
   This step is exactly where all instances must share $\varphi_{\Go{B}}$, i.e.\
   share $\Go{B}$.
-\item[Soundness.] Equation~\eqref{eq:batchverify} is the single-instance
-  check~\eqref{eq:sigmaverify} for the \emph{random linear combination}
-  $\sum_i \K{\gamma_i}\vv{C}_i$ of the statements. Because every $\K{\gamma_i}$ is
-  derived after all $\vv{C}_i$ and $\vv{R}$ are fixed, and the $\K{\gamma_i}$
-  are distinct, a prover who does not know a preimage of some $\vv{C}_i$
-  can only pass with negligible probability; this is the standard
-  small-exponent/random-combination argument for batch verification of
-  linear relations. Including the index $i$ in the hash gives each instance
-  its own challenge, which prevents a witness of one instance from being
-  moved to another.
+\item[Soundness.] Lemma~\ref{lem:batch} below: if any $\vv{C}_i$ is not in the
+  image of $\varphi_{\Go{B}}$, the check~\eqref{eq:batchverify} passes with
+  probability at most $1/p$ over the choice of $\K{\gamma_i}$ alone. Including
+  the index $i$ in the hash gives each instance its own independent challenge,
+  which the lemma needs.
 \item[Zero knowledge.] Unchanged: $\vv{s}$ is a sum of uniformly random
   $\vv{\rho}_i$ plus witness terms, hence uniform.
 \end{description}
 \end{whybox}
+
+\begin{lemma}[Soundness of the batched check]
+\label{lem:batch}
+Let $\varphi : \F^8 \to \GG{1}^5$ be linear, let $\vv{C}_1,\dots,\vv{C}_n \in \GG{1}^5$
+and $\vv{R} \in \GG{1}^5$ be fixed, and let $\K{\gamma_1},\dots,\K{\gamma_n}$ be
+independent and uniform in $\F$. If $\vv{C}_j \notin \operatorname{im}\varphi$ for
+some $j$, then the probability that there exists any $\vv{s} \in \F^8$ with
+$\varphi(\vv{s}) = \sum_i \K{\gamma_i}\vv{C}_i + \vv{R}$ is at most $1/p$.
+\end{lemma}
+\begin{proof}
+Fix all $\K{\gamma_i}$ with $i \ne j$ and write
+$\Go{D} := \vv{R} + \sum_{i \ne j} \K{\gamma_i}\vv{C}_i$. A response exists iff
+$\Go{D} + \K{\gamma_j}\vv{C}_j \in \operatorname{im}\varphi$. If this held for two
+values $\K{\gamma_j} \ne \K{\gamma'_j}$, then, $\operatorname{im}\varphi$ being a
+subspace, $(\K{\gamma_j}-\K{\gamma'_j})\vv{C}_j \in \operatorname{im}\varphi$ and
+hence $\vv{C}_j \in \operatorname{im}\varphi$, a contradiction. So at most one
+value of $\K{\gamma_j}$ admits a response, and it is hit with probability
+$1/p$.
+\end{proof}
+
+In the random-oracle model the $\K{\gamma_i}$ of~\eqref{eq:batchc} are
+independent and uniform once $\vv{C}_1,\dots,\vv{C}_n$ and $\vv{R}$ are fixed,
+so a prover who tries $q$ hash queries succeeds on a false statement with
+probability at most $q/p$. Knowledge of each individual witness follows from
+$n+1$ accepting transcripts with affinely independent challenge vectors, which
+a forking argument extracts; the linear system they define is triangular and
+yields a preimage of every $\vv{C}_i$.
 
 Range proofs batch independently: Bulletproofs aggregate the $n$ commitments
 $\Go{P_1},\dots,\Go{P_n}$ into one proof of size logarithmic in $n$.
@@ -834,74 +1138,273 @@ shared base is not visible at spend time.
 
 Sharing $\Go{B}$ across a batch is what makes~\eqref{eq:batchverify} possible,
 but it removes the guarantee of Section~\ref{sec:ps} that every signature has
-its own base. All notes of a batch are PS signatures on the same $\Go{B}$, and
-PS signatures on a common base are closed under affine combination: for any
-scalars $\K{\lambda_i}$ with $\sum_i \K{\lambda_i} = 1$,
-\[
+its own base, and PS unforgeability is only claimed for fresh bases. All notes
+of a batch are PS signatures on the same $\Go{B}$, and PS signatures on a
+common base are closed under affine combination: for any scalars
+$\K{\lambda_i}$ with $\sum_i \K{\lambda_i} = 1$,
+\begin{equation}
   \sum_{i} \K{\lambda_i}\,\Go{\sigma_i}
   \;=\; \Bigl(\K{x_0} + \sum_{j=1}^{3} \K{x_j} \sum_i \K{\lambda_i}\,\K{m_{j,i}}\Bigr)\,\Go{B}
-\]
+  \label{eq:affine}
+\end{equation}
 is a valid signature on the attribute vector $\sum_i \K{\lambda_i}\,\vv{m}_i$.
-This is the forgery Coconut's footnote~3 warns about~\cite{coconut}. For the
-present scheme it means that a user holding two notes of one batch with the
-same spend condition ($\K{m_{3,1}} = \K{m_{3,2}}$) and different amounts can
-derive a signature on an arbitrary amount $\K{\lambda}\K{m_{1,1}} + (1-\K{\lambda})\K{m_{1,2}}$
-with a fresh serial secret, and the range proofs of the original notes say
-nothing about it. Whether this is exploitable end to end depends on the
-transaction layer (e.g.\ whether amounts are range-proven again when spent), and
-the analysis, as well as possible mitigations such as per-note bases with
-per-instance responses for the $\Go{B}$-dependent components of
-$\varphi_{\Go{B}}$, is listed in Section~\ref{sec:future}. Until it is
-settled, the batched issuance should be regarded as a proof-size optimisation
-whose security is not yet established.
+This is the forgery Coconut's footnote~3 warns about~\cite{coconut}.
 
-\section{Benchmarks}
+\paragraph{The attack end to end.} A user requests two notes in one batch with
+amounts $\K{v_1} \ne \K{v_2}$, both range-proven, and the same spend condition
+$\auth$, so $\K{m_{3,1}} = \K{m_{3,2}}$. After aggregation the user holds
+$(\Go{B},\Go{\sigma_1})$ and $(\Go{B},\Go{\sigma_2})$. For any target amount
+$\K{v^*}$ the user picks $\K{\lambda} = (\K{v^*} - \K{v_2})/(\K{v_1} - \K{v_2})$
+and forms $\Go{\sigma^*} = \K{\lambda}\Go{\sigma_1} + (1-\K{\lambda})\Go{\sigma_2}$,
+a valid signature on amount $\K{v^*}$, serial secret
+$\K{\lambda}\K{m_{2,1}} + (1-\K{\lambda})\K{m_{2,2}}$ and the known spend
+condition. The serial is fresh, so its nullifier is not in $N$. The user spends
+$\Go{\sigma^*}$ as the single input of a transaction with $\K{v^*}$ in
+$\Go{P'}$, and requests outputs totalling $\K{v^*}$, each with an honest range
+proof. Every check of Section~\ref{sec:tx} passes: inputs are not range-proven,
+and nothing else constrains $\K{v^*}$. The user has created $\K{v^*}$ units
+from nothing, and the two original notes remain spendable.
 
-This section evaluates the performance of the proposed confidential federated
-eCash protocol through a series of benchmarks covering its main operations.
-The analysis considers the computational cost incurred by both the prover and
-the verifier, the size of the generated proofs, and the storage requirements of
-an eCash note throughout its lifecycle. Additionally, implementation
-measurements are presented for each protocol phase to assess the protocol's
-practicality and identify its computational bottlenecks.
+The attack needs only two notes with equal $\K{m_3}$, which the user controls,
+so it cannot be prevented on the user side; it is mitigated only by preventing
+two signatures on one base, by making the amount of an input range-proven again
+at spend time, or by both.
 
-\subsection{Proof sizes}
+\subsection{Mitigation: per-note bases with partially amortised responses}
+\label{sec:mitigation}
 
-The proof sizes differ significantly between the issuance and spending phases
-due to the different security requirements of each operation. During issuance,
-the user must prove the correctness of several committed values while
-preserving their confidentiality. When multiple eCash notes are requested
-simultaneously, these proofs are batched as in Section~\ref{sec:batching},
-which keeps the $\Sigma$-proof at a constant $496$ bytes independent of the
-number of notes; only the statements $\vv{C}_i$ grow linearly.
+The affine combination~\eqref{eq:affine} is only possible because the rows of
+$\varphi_{\Go{B}}$ that involve the base are shared. The rows for $\Go{P}$ and
+$\Go{C_m}$ use fixed generators and can be batched by the lemma for any set of
+notes; the rows for $\Go{C_1},\Go{C_2},\Go{C_3}$ are the only ones that need a
+common map. Giving every note its own base $\Go{B_i} = \Hg(\Go{C_{m,i}})$ as in
+the single-note scheme and batching only what can be batched yields the
+following protocol. Write the witness of note $i$ as
+$\vv{w}_i = (\vv{m}_i, \K{r_{p,i}}, \K{r_{m,i}}, \vv{r}_i)$ with
+$\vv{m}_i = (\K{m_{1,i}},\K{m_{2,i}},\K{m_{3,i}})$ and $\vv{r}_i = (\K{r_{1,i}},\K{r_{2,i}},\K{r_{3,i}})$.
+\begin{enumerate}[nosep]
+  \item The prover samples $\vv{\rho}_i \sample \F^8$ for every note and
+        computes the commitments $\vv{R}_i = \varphi_{\Go{B_i}}(\vv{\rho}_i)$.
+        Let $\Go{R_P} = \sum_i \vv{R}_{i,1}$ and $\Go{R_{C_m}} = \sum_i \vv{R}_{i,2}$
+        be the sums of the first two rows.
+  \item Challenges: $\K{\gamma_i} = \Hs(\dtag_{\mathrm{iss}} \,\|\, \vv{C}_1 \,\|\cdots\|\, \vv{C}_n \,\|\, \Go{R_P} \,\|\, \Go{R_{C_m}} \,\|\, \vv{R}_{1,3..5} \,\|\cdots\|\, \vv{R}_{n,3..5} \,\|\, i)$.
+  \item Responses: per note
+        $\vv{s}_{m,i} = \vv{\rho}_{m,i} + \K{\gamma_i}\vv{m}_i \in \F^3$ and
+        $\vv{s}_{r,i} = \vv{\rho}_{r,i} + \K{\gamma_i}\vv{r}_i \in \F^3$;
+        shared
+        $\K{s_p} = \sum_i (\K{\rho_{p,i}} + \K{\gamma_i}\K{r_{p,i}})$ and
+        $\K{s_m} = \sum_i (\K{\rho_{m,i}} + \K{\gamma_i}\K{r_{m,i}})$.
+  \item The proof is $(\K{\gamma_1}, \{\vv{s}_{m,i}, \vv{s}_{r,i}\}_i, \K{s_p}, \K{s_m})$:
+        the commitments are not sent, the verifier recomputes them from the
+        responses and the challenges and re-derives the hash. Since all
+        $\K{\gamma_i}$ come from one hash state, sending $\K{\gamma_1}$ suffices
+        to check the whole derivation.
+\end{enumerate}
+The verifier recomputes $\Go{B_i}$ and checks the two batched rows and the
+$3n$ per-note rows:
+\begin{align}
+  \textstyle\sum_i \K{s_{m_1,i}}\,\Go{G_p} + \K{s_p}\,\Go{H_p} &= \Go{R_P} + \textstyle\sum_i \K{\gamma_i}\,\Go{P_i}, \\
+  \textstyle\sum_i \bigl(\K{s_{m_1,i}}\Go{H_1} + \K{s_{m_2,i}}\Go{H_2} + \K{s_{m_3,i}}\Go{H_3}\bigr) + \K{s_m}\,\Go{G_1} &= \Go{R_{C_m}} + \textstyle\sum_i \K{\gamma_i}\,\Go{C_{m,i}}, \\
+  \K{s_{m_j,i}}\,\Go{B_i} + \K{s_{r_j,i}}\,\Go{G_1} &= \vv{R}_{i,2+j} + \K{\gamma_i}\,\Go{C_{j,i}} \qquad (i \le n,\; j \le 3).
+\end{align}
+Soundness: the per-note rows are ordinary $\Sigma$-protocol instances, so two
+transcripts per note extract $\vv{m}_i$ and $\vv{r}_i$; the batched rows then
+satisfy Lemma~\ref{lem:batch}, and because the same responses $\K{s_{m_j,i}}$
+appear in both, the extracted $\K{m_{1,i}}$ is the amount in $\Go{P_i}$ as well
+as in $\Go{C_{1,i}}$. Zero knowledge is as before. Every note is signed on its
+own base $\Go{B_i}$, so~\eqref{eq:affine} no longer applies and the
+single-note analysis of Section~\ref{sec:analysis} carries over unchanged.
 
-In contrast, the spending phase only requires the user to demonstrate
-ownership of a valid eCash note. This is the short $\Sigma$-proof for $\psi$,
-consisting of the challenge and three responses, so the spending proof is
-compact but still grows linearly with the number of notes being spent.
-Table~\ref{tab:sizes} shows the proof sizes for each phase, with $\GG{1}$ and
-$\GG{2}$ denoting group elements of the respective groups and $s$ a $32$-byte
-scalar. For an example transaction with $100$ eCash notes as both inputs and
-outputs, the complete transaction (proofs plus the statements and shown
-elements of every note) takes approximately $72$\,KB, only slightly over
-Fedimint's $64$\,KB consensus limit.
+The proof has $6n + 3$ scalars, about $192n + 96$ bytes, against $496$ bytes
+for the fully amortised proof and $496n$ bytes for $n$ independent proofs. The
+mints perform $3n$ additional small multi-scalar multiplications. For the
+$100$-note example of Section~\ref{sec:perf} the issuance proof grows from
+$0.5$\,KB to $19.3$\,KB. Whether this is acceptable, or whether a
+logarithmic-size compressed $\Sigma$-protocol~\cite{acf21} should replace it,
+is left open. The prototype implements the fully amortised variant of
+Section~\ref{sec:batchproof}; until it is replaced, the batched issuance must be
+regarded as insecure.
 
-\begin{table}[h]
+\section{Security Analysis}
+\label{sec:analysis}
+
+We argue each goal of Section~\ref{sec:model} for the single-note scheme of
+Section~\ref{sec:scheme} and for batching with the mitigation of
+Section~\ref{sec:mitigation}. The arguments are sketches in the style of
+Coconut's security appendix; a full reduction is future work.
+
+\paragraph{Correctness.} Shown inline: equations~\eqref{eq:blindsign},
+\eqref{eq:unblind}, \eqref{eq:lagrange} and the expansion
+of~\eqref{eq:spendverify}.
+
+\paragraph{Unforgeability.} Suppose an adversary corrupting fewer than $t$
+mints outputs $k$ valid spends with distinct nullifiers whose committed amounts
+exceed what it was issued. Each spend contains a $\psi$-proof, so by special
+soundness we extract $(\K{m_1},\K{m_2},\K{r'_p})$ with
+$\Gt{K'} = \K{m_1}\Gt{X_1} + \K{m_2}\Gt{X_2}$ and $\Go{P'} = \K{m_1}\Go{G_p} + \K{r'_p}\Go{H_p}$;
+the pairing check then says $(\Go{B'},\Go{\sigma'})$ is a PS signature on
+$(\K{m_1},\K{m_2},\K{m_3})$ under the aggregate key. Distinct nullifiers mean
+distinct $(\K{m_1},\K{m_2})$, hence $k$ signatures on distinct messages. Each
+honest issuance produced one signature, on the attributes extracted from its
+$\varphi_{\Go{B}}$-proof, and those attributes had range-proven amounts; by
+binding of $\Go{P}$ (DL) the amount in the signature is the amount in the range
+proof. If the $k$ messages are among the issued ones, the sum of the amounts is
+bounded by what was issued, contradicting the assumption; otherwise some
+message was never signed by the honest mints, and because fewer than $t$ key
+shares reveal nothing about the key (Shamir), the adversary has forged a PS
+signature, contradicting PS unforgeability. The reduction needs each honest
+signature to be on a fresh base, which~\eqref{eq:h} provides via the random
+oracle $\Hg$ and the binding of $\Go{C_m}$: two requests with the same
+$\Go{C_m}$ open to the same attributes, so they are the same message. This is
+the step that fails for the fully amortised batch.
+
+\paragraph{Blindness.} A mint's view of an issuance is
+$(\vv{C}, \vv{R}, \vv{s})$ plus the range proof. $\Go{P}$, $\Go{C_m}$ and
+$\Go{C_j}$ are perfectly hiding because $\K{r_p},\K{r_m},\K{r_j}$ are uniform;
+$(\vv{R},\vv{s})$ is simulatable without the witness (Appendix~\ref{app:sigma});
+and the range proof is zero knowledge. Hence the view is simulatable from the
+range alone. Blindness holds information-theoretically for the commitments and
+computationally for the proofs, against any number of colluding mints.
+
+\paragraph{Unlinkability.} An adversary holding all key shares sees at
+issuance $(\Go{B}, \vv{C}, \pi)$ and at spend
+$(\Go{B'}, \Go{\sigma'}, \Gt{V}, \Go{P'}, \Gt{K'}, \auth, \pi')$. The spend
+elements are determined by $(\Go{B},\Go{\sigma})$, the attributes and fresh
+randomness $\K{r},\K{r'},\K{r'_p}$. Under DDH in $\GG{1}$, $(\Go{B},\K{r}\Go{B})$
+is indistinguishable from $(\Go{B},\Go{U})$ for random $\Go{U}$, and
+$\Go{\sigma'}$ is a function of $\Go{B'}$ and public data; $\Go{P'}$ is a fresh
+perfectly hiding commitment; $\Gt{K'}$ is independent of the issuance
+transcript because $\K{m_2}$ appeared there only inside hiding commitments;
+and $\auth$ likewise appeared only as $\K{m_3}$ inside hiding commitments.
+Hence the spend transcript is simulatable from the public key, the attributes'
+nullifier and $\auth$, none of which the issuance transcript determines. Note
+that this argument needs $\K{r'_p}$ to be fresh; the prototype's reuse of
+$\K{r_p}$ breaks it outright (Section~\ref{sec:impl}).
+
+\paragraph{Double-spend detection.} $\Gt{K'}$ is a deterministic function of
+$(\K{m_1},\K{m_2})$, so two spends of one note coincide. Two different notes
+have independent uniform $\K{m_2}$, so their nullifiers coincide with
+probability $1/p$. A spender cannot present a different nullifier for the same
+note: the pairing check fixes $\Gt{X_0} + \Gt{K'} + \K{m_3}\Gt{X_3}$ to be the
+message under which $(\Go{B'},\Go{\sigma'})$ verifies, and by PS unforgeability
+the only such messages are the issued ones; the $\psi$-proof then forces
+$\Gt{K'}$ to be the attribute term of that message rather than an arbitrary
+element.
+
+\paragraph{Value confidentiality.} $\Go{P}$ and $\Go{P'}$ are perfectly
+hiding. $\Gt{K'} = \K{m_1}\Gt{X_1} + \K{m_2}\Gt{X_2}$ hides $\K{m_1}$ under DDH in
+$\GG{2}$ because $\K{m_2}\Gt{X_2}$ is a uniform mask; this is a one-time mask,
+which suffices since a note is meant to be spent once. The balance
+check~\eqref{eq:balance} reveals only the sum relation, and $\K{\delta}$ is
+uniform.
+
+\paragraph{What is not covered.} The role of $\Gt{V}$ (Section~\ref{sec:V});
+the interaction between unlinkability and the public $\auth$, which a payee
+could reuse across notes and thereby link its own notes (a usage question, not
+a scheme one); and side channels in the prototype.
+
+\section{Performance}
+\label{sec:perf}
+
+\subsection{Sizes}
+
+Table~\ref{tab:elems} lists what is transmitted per note in each phase, using
+compressed encodings ($48$ bytes for $\GG{1}$, $96$ for $\GG{2}$, $32$ for a
+scalar). Table~\ref{tab:sizes} gives the proofs as a function of the number of
+notes $n$; the range-proof row follows the Bulletproofs aggregate size
+$2\lceil\log_2(\ell n)\rceil$ $\GG{1}$ elements plus a constant for $\ell$-bit
+ranges, with $\ell = 32$ as in the original estimate.
+
+\begin{table}[htbp]
+\centering
+\caption{Bytes per note in each phase, excluding proofs.}
+\label{tab:elems}
+\tabsize
+\begin{tabular}{@{}llr@{}}
+\toprule
+Phase & Elements & Bytes \\
+\midrule
+Issuance request & $\vv{C} = (\Go{P},\Go{C_m},\Go{C_1},\Go{C_2},\Go{C_3})$ & 240 \\
+Signature share (per mint) & $\Go{\widetilde{\sigma}_i}$ & 48 \\
+Stored note & $\Go{B},\Go{\sigma},\K{m_1},\K{m_2},\K{r_p},\auth$ & 224 \\
+Spend & $\Go{B'},\Go{\sigma'},\Go{P'},\Gt{K'},\Gt{V},\auth$ & 368 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[htbp]
 \centering
 \caption{Proof size as a function of the number of eCash notes $n$. The range
 proofs are assumed to be for a 32-bit range.}
 \label{tab:sizes}
 \tabsize
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}llr@{}}
 \toprule
-Phase & Proof size & Growth \\
+Proof & Size & Growth \\
 \midrule
-Issuance (batched $\Sigma$-proof) & $5\,\GG{1} + 8\,s$ & $O(1)$ \\
-Issuance (batched range proofs) & $2\log_2(32 \times n)\,\GG{1} + 9\,\GG{1} + 2\,s$ & $O(\log_2 n)$ \\
-Spending & $4 \times n \times s$ & $O(n)$ \\
+Issuance, fully amortised (\S\ref{sec:batchproof}) & $5\,\GG{1} + 8\,s = 496$\,B & $O(1)$ \\
+Issuance, per-note bases (\S\ref{sec:mitigation}) & $(6n+3)\,s \approx 192n$\,B & $O(n)$ \\
+Issuance, independent proofs & $n(5\,\GG{1} + 8\,s) = 496n$\,B & $O(n)$ \\
+Issuance, aggregated range proof & $(2\lceil\log_2 32n\rceil + 9)\,\GG{1} + 2\,s$ & $O(\log n)$ \\
+Spend & $4n\,s = 128n$\,B & $O(n)$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+For a transaction with $100$ inputs and $100$ outputs the totals are: inputs
+$100 \times (368 + 128) = 49.6$\,KB; outputs $100 \times 240 = 24.0$\,KB plus
+the issuance proof ($0.5$\,KB amortised, $19.3$\,KB with per-note bases) plus
+the aggregated range proof ($33\,\GG{1} + 2\,s = 1.6$\,KB); and $32$ bytes for
+$\K{\delta}$. That is $75.7$\,KB with the amortised proof and $94.5$\,KB with
+per-note bases, against Fedimint's $64$\,KB consensus limit. Spends dominate:
+the two $\GG{2}$ elements $\Gt{K'}$ and $\Gt{V}$ account for $192$ of the $496$
+bytes per input, which is one reason to settle the role of $\Gt{V}$
+(Section~\ref{sec:V}). Dropping $\Gt{V}$ and the $\auth$ preimage (which the
+transaction layer may carry once per transaction) brings an input to $368$
+bytes and the $100/100$ transaction to $62.9$\,KB amortised.
+
+\subsection{Timings}
+\label{sec:timings}
+
+Table~\ref{tab:timings} reports wall-clock timings of the prototype, built in
+release mode with the pure-Rust \texttt{bls12\_381} crate, single-threaded, on
+one core of an AMD Ryzen AI 9 HX 370 laptop processor; each figure is the
+median of seven runs. Issuance timings are for a batch of $n$ notes under the
+fully amortised proof; all other rows are per note and independent of $n$.
+
+\begin{table}[htbp]
+\centering
+\caption{Measured timings of the prototype in milliseconds.}
+\label{tab:timings}
+\tabsize
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Operation & $n=1$ & $n=10$ & $n=100$ \\
+\midrule
+Issuance: statements and proof (user) & 5.1 & 59.0 & 1416 \\
+Issuance: proof verification (per mint) & 3.7 & 22.7 & 1027 \\
+Blind signing of the batch (per mint) & 0.9 & 8.4 & 85.3 \\
+Unblind and verify one share (user, per mint) & 4.0 & 4.0 & 4.1 \\
+Aggregate 5 of 7 shares (user) & 1.1 & 1.1 & 1.2 \\
+Spend: re-randomise and prove (user) & 7.3 & 7.3 & 7.4 \\
+Spend: verify proof and pairing (per mint) & 4.6 & 4.6 & 4.7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations. First, every per-note operation is in the low milliseconds,
+dominated by pairings (two per share verification, two per spend verification)
+and by the scalar multiplications of the $\Sigma$-proofs; a mint validating the
+$100/100$ transaction above spends about $0.5$\,s on spends and the same again
+on signing shares. Second, the issuance proof scales quadratically rather than
+linearly in the prototype: $n = 100$ costs $240$ times $n = 1$ rather than
+$100$ times. The cause is the challenge derivation~\eqref{eq:batchc}, which
+re-serialises and re-hashes all $n$ statements for each of the $n$
+challenges. Deriving all challenges from one hash state over the statements,
+as the mitigation of Section~\ref{sec:mitigation} already specifies, removes
+the quadratic term; the group operations themselves are linear in $n$. The
+user-side issuance time also includes computing the statements and an internal
+self-check of the proof.
 
 \section{Implementation Notes}
 \label{sec:impl}
@@ -928,52 +1431,210 @@ description that are worth knowing about.
 \end{itemize}
 \end{warnbox}
 
-\section{Future Work}
-\label{sec:future}
+\section{Open Problems}
+\label{sec:open}
 
 \begin{enumerate}[nosep]
-  \item Add security assumptions made in the scheme (LRSW/PS unforgeability,
-        DDH in $\GG{1}$ and $\GG{2}$, random oracles for $\Hg$, $\Hs$) and a
-        proof sketch.
-  \item Add the description and design of the peg-in and peg-out operations
-        when joining the federation.
-  \item Analyse the affine-combination attack of Section~\ref{sec:sharedh}
-        enabled by the shared base $\Go{B}$ in a batched issuance, and its
-        mitigations (per-note bases, range proofs at spend time, or a batching
-        strategy that keeps distinct bases).
-  \item Add and check the bounds provided for proof batching (soundness error
-        of~\eqref{eq:batchverify}).
-  \item Decide whether $\Gt{V}$ and the $\K{r'}$ terms of~\eqref{eq:rerand}
-        are needed (Section~\ref{sec:V}).
-  \item Fix the prototype deviations of Section~\ref{sec:impl}.
-  \item Add acknowledgments.
+  \item \textbf{Batching.} Replace the fully amortised proof with the per-note
+        base variant of Section~\ref{sec:mitigation} or a compressed
+        $\Sigma$-protocol, and decide whether inputs should additionally be
+        range-proven at spend time as defence in depth.
+  \item \textbf{Formal security proof.} Turn the sketches of
+        Section~\ref{sec:analysis} into reductions, in particular a game-based
+        balance definition and its reduction to PS unforgeability under
+        $q$-MSDH-1 with the hashed base.
+  \item \textbf{The element $\Gt{V}$.} Either justify it or remove it and the
+        $\K{r'}$ terms of~\eqref{eq:rerand} (Section~\ref{sec:V}); removal saves
+        $96$ bytes and one $\GG{2}$ multiplication per spend.
+  \item \textbf{Transaction size.} The $100/100$ example exceeds the consensus
+        limit in all variants. Options are a larger limit, fewer notes per
+        transaction through change-making, or a smaller spend encoding.
+  \item \textbf{Key rotation and nullifier pruning.} Fedimint rotates keys per
+        epoch; the nullifier set and the aggregate key need a lifecycle.
+  \item \textbf{Prototype fixes} listed in Section~\ref{sec:impl}, and a
+        standard hash-to-curve ciphersuite~\cite{rfc9380}.
 \end{enumerate}
 
-\begin{thebibliography}{9}
+\section{Conclusion}
+
+Hiding the amount of a federated eCash note is possible with the same
+machinery that makes Fedimint work today, threshold signing with Shamir shares
+and Lagrange interpolation in the exponent, once the signature is one whose
+signing map is linear in both key and messages. Pointcheval--Sanders
+signatures issued Coconut-style provide that, Pedersen commitments and
+Bulletproofs make the hidden amounts balanceable and bounded, and the
+hidden-attribute term of the verification equation doubles as a nullifier. The
+resulting notes are unlinkable, confidential and detectably single-spend. The
+remaining cost is size: inputs carry about half a kilobyte each, and the one
+optimisation that makes outputs cheap, a shared signature base, is also the
+one that must not be used. The per-note base variant restores the security
+argument at a size the consensus layer can likely absorb; proving the scheme
+formally and shrinking the spend are the next steps.
+
+\paragraph{Acknowledgements.} The prototype builds on the single-issuer
+scheme and notes by joschisan; the amortised proof and its implementation were
+added in this repository.
+
+\begin{thebibliography}{99}
+\bibitem{chaum83}
+D.~Chaum, ``Blind signatures for untraceable payments,'' in \emph{Advances in
+Cryptology: CRYPTO '82}, Plenum, 1983.
+
+\bibitem{fedimint}
+Fedimint contributors, ``Fedimint: a federated Chaumian mint,''
+\url{https://fedimint.org}, source at
+\url{https://github.com/fedimint/fedimint}. Accessed: 2026-09-30.
+
+\bibitem{bls01}
+D.~Boneh, B.~Lynn, and H.~Shacham, ``Short signatures from the Weil pairing,''
+in \emph{ASIACRYPT 2001}, LNCS 2248, Springer, 2001.
+
+\bibitem{boldyreva03}
+A.~Boldyreva, ``Threshold signatures, multisignatures and blind signatures
+based on the gap-Diffie-Hellman-group signature scheme,'' in \emph{PKC 2003},
+LNCS 2567, Springer, 2003.
+
+\bibitem{cl04}
+J.~Camenisch and A.~Lysyanskaya, ``Signature schemes and anonymous credentials
+from bilinear maps,'' in \emph{CRYPTO 2004}, LNCS 3152, Springer, 2004.
+
+\bibitem{ps16}
+D.~Pointcheval and O.~Sanders, ``Short randomizable signatures,'' in
+\emph{CT-RSA 2016}, LNCS 9610, Springer, 2016.
+
+\bibitem{ps18}
+D.~Pointcheval and O.~Sanders, ``Reassessing security of randomizable
+signatures,'' in \emph{CT-RSA 2018}, LNCS 10808, Springer, 2018.
+
+\bibitem{lrsw99}
+A.~Lysyanskaya, R.~Rivest, A.~Sahai, and S.~Wolf, ``Pseudonym systems,'' in
+\emph{SAC 1999}, LNCS 1758, Springer, 1999.
+
 \bibitem{coconut}
 A.~Sonnino, M.~Al-Bassam, S.~Bano, S.~Meiklejohn, and G.~Danezis,
 ``Coconut: Threshold issuance selective disclosure credentials with applications
-to distributed ledgers,'' in \emph{Proceedings of the Network and Distributed
-System Security Symposium (NDSS)}, Internet Society, 2019.
+to distributed ledgers,'' in \emph{NDSS 2019}, Internet Society, 2019.
 \url{https://arxiv.org/abs/1802.07344}.
 
 \bibitem{nym}
-Nym Technologies SA, ``The Nym network.''
+Nym Technologies SA, ``The Nym network,''
 \url{https://nymtech.net/nym-whitepaper.pdf}, 2021. Accessed: 2026-07-28.
+
+\bibitem{rial23}
+A.~Rial and A.~M. Piotrowska, ``Compact and divisible e-cash with threshold
+issuance,'' \emph{Proceedings on Privacy Enhancing Technologies}, 2023.
+\url{https://arxiv.org/abs/2303.08221}.
 
 \bibitem{nymcode}
 Nym Technologies SA, ``nym\_offline\_compact\_ecash,'' Rust crate in the
 \texttt{nymtech/nym} repository (\texttt{common/nym\_offline\_compact\_ecash}),
 2024. Accessed: 2026-09-16.
 
-\bibitem{ps16}
-D.~Pointcheval and O.~Sanders, ``Short randomizable signatures,'' in
-\emph{CT-RSA 2016}, LNCS 9610, Springer, 2016.
+\bibitem{pedersen91}
+T.~P. Pedersen, ``Non-interactive and information-theoretic secure verifiable
+secret sharing,'' in \emph{CRYPTO '91}, LNCS 576, Springer, 1992.
+
+\bibitem{maxwell15}
+G.~Maxwell, ``Confidential transactions,'' 2015.
+\url{https://elementsproject.org/features/confidential-transactions/investigation}.
 
 \bibitem{bulletproofs}
 B.~B\"unz, J.~Bootle, D.~Boneh, A.~Poelstra, P.~Wuille, and G.~Maxwell,
 ``Bulletproofs: Short proofs for confidential transactions and more,'' in
 \emph{IEEE Symposium on Security and Privacy}, 2018.
+
+\bibitem{chl05}
+J.~Camenisch, S.~Hohenberger, and A.~Lysyanskaya, ``Compact e-cash,'' in
+\emph{EUROCRYPT 2005}, LNCS 3494, Springer, 2005.
+
+\bibitem{zcash}
+D.~Hopwood, S.~Bowe, T.~Hornby, and N.~Wilcox, ``Zcash protocol
+specification,'' \url{https://zips.z.cash/protocol/protocol.pdf}.
+
+\bibitem{bgr98}
+M.~Bellare, J.~A. Garay, and T.~Rabin, ``Fast batch verification for modular
+exponentiation and digital signatures,'' in \emph{EUROCRYPT '98}, LNCS 1403,
+Springer, 1998.
+
+\bibitem{acf21}
+T.~Attema and R.~Cramer, ``Compressed $\Sigma$-protocol theory and practical
+application to plug \& play secure algorithmics,'' in \emph{CRYPTO 2020}, LNCS
+12172, Springer, 2020.
+
+\bibitem{fs86}
+A.~Fiat and A.~Shamir, ``How to prove yourself: Practical solutions to
+identification and signature problems,'' in \emph{CRYPTO '86}, LNCS 263,
+Springer, 1987.
+
+\bibitem{shamir79}
+A.~Shamir, ``How to share a secret,'' \emph{Communications of the ACM},
+22(11), 1979.
+
+\bibitem{rfc9380}
+A.~Faz-Hern\'andez, S.~Scott, N.~Sullivan, R.~S. Wahby, and C.~A. Wood,
+``Hashing to elliptic curves,'' RFC 9380, IETF, 2023.
 \end{thebibliography}
+
+\appendix
+\section{\texorpdfstring{$\Sigma$}{Sigma}-protocols for Linear Maps}
+\label{app:sigma}
+
+Both proofs of the scheme are instances of one protocol: a proof of knowledge
+of a preimage under a linear map. Let $V$ and $W$ be finite-dimensional
+$\F$-vector spaces, in our instantiations $V = \F^k$ and $W$ a product of
+pairing groups, and let $\varphi : V \to W$ be linear. The public statement is
+$Y \in \operatorname{im}\varphi$; the prover knows $\vv{x} \in V$ with
+$\varphi(\vv{x}) = Y$. The full set of witnesses is the affine subspace
+$\vv{x} + \ker\varphi$. The witness is the prover's private input and is never
+transmitted.
+
+\paragraph{Interactive protocol.}
+\begin{align*}
+  &\textbf{commit:}    && \vv{\rho} \sample V, \quad R = \varphi(\vv{\rho}), && \text{prover} \to \text{verifier: } R \\
+  &\textbf{challenge:} && \K{\gamma} \sample \F,                              && \text{verifier} \to \text{prover: } \K{\gamma} \\
+  &\textbf{respond:}   && \vv{s} = \vv{\rho} + \K{\gamma}\,\vv{x},            && \text{prover} \to \text{verifier: } \vv{s} \\
+  &\textbf{verify:}    && \varphi(\vv{s}) \eqq R + \K{\gamma}\,Y .
+\end{align*}
+
+\paragraph{Properties.}
+\begin{description}[nosep,leftmargin=1.2em]
+\item[Completeness.] $\varphi(\vv{s}) = \varphi(\vv{\rho}) + \K{\gamma}\varphi(\vv{x}) = R + \K{\gamma}Y$.
+\item[Special soundness.] Two accepting transcripts $(R,\K{\gamma},\vv{s})$ and
+  $(R,\K{\gamma'},\vv{s}')$ with $\K{\gamma} \ne \K{\gamma'}$ give
+  $\varphi(\vv{s}-\vv{s}') = (\K{\gamma}-\K{\gamma'})Y$, so
+  $(\K{\gamma}-\K{\gamma'})^{-1}(\vv{s}-\vv{s}')$ is a witness. The knowledge
+  error is $1/p$.
+\item[Honest-verifier zero knowledge.] A simulator samples $\vv{s} \sample V$
+  and $\K{\gamma} \sample \F$ and sets $R = \varphi(\vv{s}) - \K{\gamma}Y$; the
+  transcript is distributed exactly as a real one. Since $\vv{s}$ is uniform on
+  $V$, nothing about which element of $\vv{x} + \ker\varphi$ the prover holds
+  leaks; in particular $\vv{s}$ is a one-time pad of $\K{\gamma}\vv{x}$ under
+  $\vv{\rho}$.
+\end{description}
+
+\paragraph{Fiat--Shamir.} The protocol is public-coin, so the challenge can be
+computed as $\K{\gamma} = \Hs(\dtag \,\|\, Y \,\|\, R)$ with $\Hs$ a random
+oracle~\cite{fs86}. The proof is $(R,\vv{s})$, or in the compact form
+$(\K{\gamma},\vv{s})$ with the verifier recomputing $R = \varphi(\vv{s}) - \K{\gamma}Y$
+and re-deriving $\K{\gamma}$. Hashing $Y$ binds the proof to the statement; the
+domain tag prevents a proof for one map from being replayed against another.
+Soundness in the random-oracle model follows from special soundness by the
+forking lemma, with a loss linear in the number of hash queries.
+
+\paragraph{Instances in this paper.}
+\begin{center}
+\tabsize
+\begin{tabular}{@{}llll@{}}
+\toprule
+Proof & Map & Form & Domain tag \\
+\midrule
+Issuance (\S\ref{sec:issuanceproof}) & $\varphi_{\Go{B}} : \F^8 \to \GG{1}^5$ & $(R,\vv{s})$ & \texttt{\ldots\_ISSUANCE} \\
+Spend (\S\ref{sec:spend}) & $\psi : \F^3 \to \GG{1}\times\GG{2}$ & $(\K{\gamma},\vv{s})$ & \texttt{\ldots\_SPEND} \\
+\bottomrule
+\end{tabular}
+\end{center}
+Schnorr identification is the instance $\varphi(x) = x\,\Go{G}$ and a Pedersen
+opening proof is $\varphi(m,r) = m\,\Go{G} + r\,\Go{H}$; the two proofs of the
+scheme differ from these only in the choice of $\varphi$.
 
 \end{document}
